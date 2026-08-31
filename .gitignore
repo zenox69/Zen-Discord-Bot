@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+coverage/
+.pgdata/
+bot-test.log
+bot-test-err.log

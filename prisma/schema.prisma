@@ -1,0 +1,400 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// Enums
+// ============================================================
+
+/// What happens to an eligibility timer when a member leaves a community.
+enum LeavePolicy {
+  RESET_ON_LEAVE
+  KEEP_ORIGINAL
+  STAFF_REVIEW
+}
+
+/// Where a membership start date came from. The UI must display this honestly.
+enum MembershipDateSource {
+  FIRST_SEEN
+  STAFF_VERIFIED
+  IMPORTED
+  OFFICIAL_API
+}
+
+enum OrderStatus {
+  DRAFT
+  SUBMITTED
+  STAFF_REVIEW
+  QUOTED
+  AWAITING_PAYMENT
+  PAID
+  IN_PROGRESS
+  READY
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum TicketType {
+  ORDER
+  SUPPORT
+}
+
+enum TicketStatus {
+  OPEN
+  CLOSED
+}
+
+enum AuditCategory {
+  VERIFICATION
+  TICKET
+  ORDER
+  ELIGIBILITY
+  COMMUNITY
+  PRODUCT
+  SYSTEM
+}
+
+// ============================================================
+// Guilds
+// ============================================================
+
+model DiscordGuild {
+  id       String        @id // Discord guild snowflake
+  name     String
+  joinedAt DateTime      @default(now())
+  settings GuildSettings?
+
+  @@map("discord_guilds")
+}
+
+model GuildSettings {
+  guildId                  String       @id // = DiscordGuild.id
+  guild                    DiscordGuild @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  marketplaceName          String       @default("Marketplace")
+  staffRoleId              String?
+  adminRoleId              String?
+  ticketCategoryId         String?
+  orderPanelChannelId      String?
+  orderLogChannelId        String?
+  ticketLogChannelId       String?
+  eligibilityLogChannelId  String?
+  verificationLogChannelId String?
+  errorLogChannelId        String?
+  timezone                 String   @default("Asia/Manila")
+  currency                 String   @default("PHP")
+  currencySymbol           String   @default("₱")
+  ticketCounter            Int      @default(0)
+  orderCounter             Int      @default(0)
+  enabled                  Boolean  @default(true)
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@map("guild_settings")
+}
+
+// ============================================================
+// Users
+// ============================================================
+
+/// Per-guild customer record (local notes/warnings). Composite key.
+model DiscordUser {
+  guildId       String
+  discordUserId String
+  notes         String?
+  warnings      Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@id([guildId, discordUserId])
+  @@map("discord_users")
+}
+
+/// A verified Roblox account linked to exactly one Discord user (global, all guilds).
+model RobloxAccount {
+  id                Int      @id @default(autoincrement())
+  discordUserId     String   @unique
+  robloxUserId      String   @unique
+  robloxUsername    String
+  robloxDisplayName String
+  verifiedAt        DateTime
+  linkedByDiscordId String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([robloxUserId])
+  @@map("roblox_accounts")
+}
+
+/// A pending profile-description challenge. Expirable, never trusted past expiresAt.
+model RobloxVerification {
+  id             Int      @id @default(autoincrement())
+  guildId        String
+  discordUserId  String
+  robloxUserId   String
+  robloxUsername String
+  code           String   @unique
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  @@index([discordUserId, guildId])
+  @@index([expiresAt])
+  @@map("roblox_verifications")
+}
+
+// ============================================================
+// Communities & memberships
+// ============================================================
+
+model RobloxCommunity {
+  id            Int         @id @default(autoincrement())
+  guildId       String
+  robloxGroupId String
+  name          String
+  requiredDays  Int
+  enabled       Boolean     @default(true)
+  emoji         String?
+  inviteUrl     String?
+  notes         String?
+  leavePolicy   LeavePolicy @default(RESET_ON_LEAVE)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  memberships CommunityMembership[]
+  products    ProductCommunity[]
+  orders      Order[]
+
+  @@unique([guildId, robloxGroupId])
+  @@index([guildId, enabled])
+  @@map("roblox_communities")
+}
+
+/// One row per (Roblox user, community). membershipStartedAt is only honest
+/// if membershipDateSource says so — never fabricate Roblox join dates.
+model CommunityMembership {
+  id                    Int                  @id @default(autoincrement())
+  robloxUserId          String
+  communityId           Int
+  isCurrentlyMember     Boolean              @default(false)
+  membershipFirstSeenAt DateTime
+  membershipStartedAt   DateTime
+  membershipDateSource  MembershipDateSource @default(FIRST_SEEN)
+  roleId                Int?
+  roleName              String?
+  rank                  Int?
+  lastMembershipCheckAt DateTime
+  membershipSeenAt      DateTime?
+  leftAt                DateTime?
+  rejoinedAt            DateTime?
+  eligibilityNotificationSentAt        DateTime?
+  eligibilityNotificationLastAttemptAt DateTime?
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+
+  community RobloxCommunity       @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  overrides EligibilityOverride[]
+
+  @@unique([robloxUserId, communityId])
+  @@index([communityId, isCurrentlyMember])
+  @@index([robloxUserId, isCurrentlyMember])
+  @@map("community_memberships")
+}
+
+/// Audit history of staff-verified membership start dates.
+model EligibilityOverride {
+  id                Int           @id @default(autoincrement())
+  membershipId      Int
+  startedAt         DateTime
+  previousStartedAt DateTime?
+  reason            String
+  setByDiscordId    String
+  createdAt         DateTime      @default(now())
+
+  membership CommunityMembership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@index([membershipId])
+  @@map("eligibility_overrides")
+}
+
+// ============================================================
+// Products
+// ============================================================
+
+model Product {
+  id                  Int      @id @default(autoincrement())
+  guildId             String
+  name                String
+  description         String
+  category            String
+  price               Decimal  @default(0) @db.Decimal(10, 2)
+  currency            String   @default("PHP")
+  enabled             Boolean  @default(true)
+  requiresEligibility Boolean  @default(true)
+  minQuantity         Int      @default(1)
+  maxQuantity         Int? // null = unlimited
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  communities ProductCommunity[]
+  orders      Order[]
+
+  @@unique([guildId, name])
+  @@index([guildId, enabled])
+  @@map("products")
+}
+
+/// A product's eligible communities. Empty = all enabled communities.
+model ProductCommunity {
+  productId   Int
+  communityId Int
+  createdAt   DateTime @default(now())
+
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  community RobloxCommunity @relation(fields: [communityId], references: [id], onDelete: Cascade)
+
+  @@id([productId, communityId])
+  @@map("product_communities")
+}
+
+// ============================================================
+// Orders
+// ============================================================
+
+model Order {
+  id                  Int            @id @default(autoincrement())
+  number              String? // assigned at SUBMIT; DRAFTs are NULL (multiple NULLs allowed in the unique)
+  guildId             String
+  ticketId            Int?           @unique
+  discordUserId       String
+  robloxUserId        String?
+  robloxUsername      String?
+  productId           Int
+  communityId         Int?
+  quantity            Int
+  details             String?
+  preferredOption     String?
+  notes               String?
+  price               Decimal        @default(0) @db.Decimal(10, 2)
+  currency            String         @default("PHP")
+  status              OrderStatus    @default(SUBMITTED)
+  assignedStaffId     String?
+  eligibilitySnapshot Json?
+  orderMessageId      String? // id of the order embed message (edited in place)
+  submittedAt         DateTime?
+  completedAt         DateTime?
+  cancelledAt         DateTime?
+  cancelReason        String?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  product   Product            @relation(fields: [productId], references: [id])
+  community RobloxCommunity?   @relation(fields: [communityId], references: [id], onDelete: SetNull)
+  ticket    Ticket?            @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  events    OrderEvent[]
+  staff     StaffAssignment[]
+
+  @@unique([guildId, number])
+  @@index([guildId, status])
+  @@index([discordUserId])
+  @@index([assignedStaffId])
+  @@map("orders")
+}
+
+model OrderEvent {
+  id             Int          @id @default(autoincrement())
+  orderId        Int
+  type           String
+  fromStatus     OrderStatus?
+  toStatus       OrderStatus?
+  actorDiscordId String
+  data           Json?
+  createdAt      DateTime     @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, createdAt])
+  @@map("order_events")
+}
+
+model StaffAssignment {
+  id             Int       @id @default(autoincrement())
+  orderId        Int
+  staffDiscordId String
+  assignedAt     DateTime  @default(now())
+  unassignedAt   DateTime?
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([staffDiscordId, unassignedAt])
+  @@map("staff_assignments")
+}
+
+// ============================================================
+// Tickets
+// ============================================================
+
+model Ticket {
+  id                Int           @id @default(autoincrement())
+  guildId           String
+  number            Int
+  type              TicketType
+  channelName       String
+  channelId         String?   @unique
+  channelMessageId  String? // welcome message id inside the ticket channel
+  discordUserId     String
+  categoryId        String
+  orderId           Int?          @unique
+  status            TicketStatus  @default(OPEN)
+  closedByDiscordId String?
+  closeReason       String?
+  closedAt          DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  order  Order?
+  events TicketEvent[]
+
+  @@unique([guildId, channelName])
+  @@index([guildId, status])
+  @@index([discordUserId, status])
+  @@map("tickets")
+}
+
+model TicketEvent {
+  id             Int      @id @default(autoincrement())
+  ticketId       Int
+  type           String
+  actorDiscordId String
+  data           Json?
+  createdAt      DateTime @default(now())
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, createdAt])
+  @@map("ticket_events")
+}
+
+// ============================================================
+// Audit
+// ============================================================
+
+model AuditLog {
+  id              Int           @id @default(autoincrement())
+  guildId         String?
+  category        AuditCategory
+  action          String
+  actorDiscordId  String?
+  targetDiscordId String?
+  details         Json?
+  createdAt       DateTime      @default(now())
+
+  @@index([guildId, category, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}

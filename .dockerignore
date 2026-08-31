@@ -1,0 +1,11 @@
+node_modules
+.pgdata
+dist
+.git
+.env
+*.log
+test
+scripts
+coverage
+Dockerfile
+.dockerignore
