@@ -92,6 +92,146 @@ export async function addProduct(
   return product;
 }
 
+/**
+ * Bulk add: one product per line in the form `Name: price`.
+ * Pure parsing — unit-testable without a database.
+ */
+
+export interface BulkLine {
+  name: string;
+  price: number;
+}
+
+export interface BulkParseFailure {
+  line: number;
+  raw: string;
+  reason: string;
+}
+
+export interface BulkParseResult {
+  entries: BulkLine[];
+  failures: BulkParseFailure[];
+}
+
+const BULK_PRICE_RE = /^\d+(\.\d{1,2})?$/;
+export const MAX_BULK_PRODUCTS = 25;
+
+export function parseBulkLines(input: string, maxProducts: number = MAX_BULK_PRODUCTS): BulkParseResult {
+  const lines = input
+    .split(/\r?\n/)
+    .map((raw, i) => ({ raw: raw.trim(), line: i + 1 }))
+    .filter((l) => l.raw.length > 0);
+
+  if (lines.length === 0) return { entries: [], failures: [] };
+  if (lines.length > maxProducts) {
+    return {
+      entries: [],
+      failures: [{ line: 0, raw: "", reason: `Too many products: found ${lines.length}, max is ${maxProducts} per call.` }],
+    };
+  }
+
+  const entries: BulkLine[] = [];
+  const failures: BulkParseFailure[] = [];
+  const seen = new Map<string, number>();
+
+  for (const { raw, line } of lines) {
+    const idx = raw.lastIndexOf(":");
+    if (idx <= 0) {
+      failures.push({ line, raw, reason: "Missing \":\" — use the format `Name: price`." });
+      continue;
+    }
+    const name = sanitizeInput(raw.slice(0, idx), 60);
+    const priceRaw = raw.slice(idx + 1).trim();
+    if (name.length < 2) {
+      failures.push({ line, raw, reason: "Name must be at least 2 characters." });
+      continue;
+    }
+    if (!BULK_PRICE_RE.test(priceRaw)) {
+      failures.push({ line, raw, reason: `Invalid price “${priceRaw}” — use a number like 4.99.` });
+      continue;
+    }
+    const price = Number(priceRaw);
+    if (!Number.isFinite(price) || price < 0) {
+      failures.push({ line, raw, reason: "Price must be a number ≥ 0." });
+      continue;
+    }
+    const key = name.toLowerCase();
+    if (seen.has(key)) {
+      failures.push({ line, raw, reason: `Duplicate name in this list (first used on line ${seen.get(key)}).` });
+      continue;
+    }
+    seen.set(key, line);
+    entries.push({ name, price });
+  }
+  return { entries, failures };
+}
+
+export interface BulkAddResult {
+  added: Product[];
+  failed: BulkParseFailure[];
+}
+
+export async function addProductsBulk(
+  guildId: string,
+  actorDiscordId: string,
+  entries: BulkLine[],
+  options: { category?: string | null; communityNames?: string[] | null; requiresEligibility?: boolean | null },
+  settings: { currency: string },
+): Promise<BulkAddResult> {
+  if (entries.length === 0) {
+    throw new AppError({ code: "EMPTY_BULK", friendly: "❌ No valid products found. Use the format `Name: price`, one per line." });
+  }
+
+  const communityNames = options.communityNames ?? [];
+  const communityIds: number[] = [];
+  for (const raw of communityNames) {
+    const c = await findCommunityByName(guildId, raw);
+    communityIds.push(c.id);
+  }
+
+  const existing = await prisma.product.findMany({ where: { guildId }, select: { name: true } });
+  const existingNames = new Set(existing.map((p) => p.name.toLowerCase()));
+
+  const added: Product[] = [];
+  const failed: BulkParseFailure[] = [];
+  const batchNames = new Set<string>();
+
+  for (const [i, entry] of entries.entries()) {
+    const key = entry.name.toLowerCase();
+    if (existingNames.has(key) || batchNames.has(key)) {
+      failed.push({ line: i + 1, raw: entry.name, reason: `A product named **${entry.name}** already exists.` });
+      continue;
+    }
+    const product = await prisma.product.create({
+      data: {
+        guildId,
+        name: entry.name,
+        description: entry.name,
+        category: sanitizeInput(options.category ?? "General", 60),
+        price: entry.price,
+        currency: settings.currency,
+        requiresEligibility: options.requiresEligibility ?? true,
+        minQuantity: 1,
+        maxQuantity: null,
+        communities: communityIds.length > 0 ? { create: communityIds.map((communityId) => ({ communityId })) } : undefined,
+      },
+    });
+    added.push(product);
+    batchNames.add(key);
+  }
+
+  if (added.length > 0) {
+    await audit({
+      category: AuditCategory.PRODUCT,
+      action: "BULK_ADDED",
+      guildId,
+      actorDiscordId,
+      details: { count: added.length, names: added.map((p) => p.name) },
+    });
+  }
+  return { added, failed };
+}
+
 export async function findProductByName(guildId: string, rawName: string): Promise<Product> {
   const needle = rawName.trim().toLowerCase();
   const all = await prisma.product.findMany({ where: { guildId } });

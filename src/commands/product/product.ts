@@ -5,6 +5,7 @@ import {
   listProducts,
   setProductEnabled,
 } from "../../services/ProductService.js";
+import { openBulkModal } from "../../interactions/product.js";
 import { findSettings } from "../../services/GuildSettingsService.js";
 import { baseEmbed, COLORS, trunc } from "../../utils/embeds.js";
 import { formatMoney } from "../../utils/discordTime.js";
@@ -28,6 +29,14 @@ export const productCommand: MarketplaceCommand = {
         .addIntegerOption((o) => o.setName("min-quantity").setDescription("Minimum quantity (default 1)").setMinValue(1))
         .addIntegerOption((o) => o.setName("max-quantity").setDescription("Maximum quantity (default unlimited)").setMinValue(1))
         .addStringOption((o) => o.setName("communities").setDescription("Restrict to communities (comma-separated names, optional)")),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("bulk")
+        .setDescription("Add many products at once via a form (one per line: Name: price, max 25)")
+        .addStringOption((o) => o.setName("category").setDescription("Category for all added (default General)").setMaxLength(60))
+        .addBooleanOption((o) => o.setName("requires-eligibility").setDescription("Require community eligibility for all added (default true)"))
+        .addStringOption((o) => o.setName("communities").setDescription("Restrict all added to communities (comma-separated, optional)")),
     )
     .addSubcommand((sub) =>
       sub
@@ -91,6 +100,17 @@ export const productCommand: MarketplaceCommand = {
               `**${p.name}** (${p.category}) — ${formatMoney(Number(p.price), settings.currencySymbol)} • ${p.requiresEligibility ? "eligibility required" : "no eligibility required"}${communities.length ? ` • restricted to ${communities.length} community(ies)` : " • all communities"}`,
             ),
         ],
+      });
+      return;
+    }
+
+    if (sub === "bulk") {
+      const communitiesRaw = interaction.options.getString("communities");
+      const communities = communitiesRaw ? communitiesRaw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+      await openBulkModal(interaction, {
+        category: interaction.options.getString("category"),
+        requiresEligibility: interaction.options.getBoolean("requires-eligibility"),
+        communityNames: communities,
       });
       return;
     }

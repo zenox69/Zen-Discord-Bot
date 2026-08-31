@@ -2,6 +2,7 @@ import { CUSTOM_ID_PREFIX } from "../config/constants.js";
 import { registerInteraction } from "../handlers/interactionHandler.js";
 import { registerEligibleInteractions } from "./eligible.js";
 import { showOrderHistory } from "./customer.js";
+import { registerProductInteractions } from "./product.js";
 import { registerVerifyInteractions } from "./buttons/verify.js";
 import {
   handleBackOrder,
@@ -34,6 +35,9 @@ export function registerAllInteractions(): void {
   registerVerifyInteractions();
   registerEligibleInteractions();
   registerInteraction(CUSTOM_ID_PREFIX.customer, "history", ["button"], showOrderHistory);
+
+  // --- Products --------------------------------------------------------------
+  registerProductInteractions();
 
   // --- Tickets -------------------------------------------------------------
   registerInteraction(CUSTOM_ID_PREFIX.ticket, "create", ["button"], createTicketFromPanel);

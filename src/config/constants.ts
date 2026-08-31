@@ -10,6 +10,7 @@ export const CUSTOM_ID_PREFIX = {
   ticket: "ticket",
   order: "order",
   customer: "customer",
+  product: "product",
   panel: "panel",
   setup: "setup",
 } as const;
