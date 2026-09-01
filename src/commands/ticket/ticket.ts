@@ -15,7 +15,7 @@ export const ticketCommand: MarketplaceCommand = {
     .addSubcommand((sub) =>
       sub
         .setName("setup")
-        .setDescription("Publish the support/order panel to the panel channel"),
+        .setDescription("Publish the marketplace panel (order, support, verification) to the panel channel"),
     )
     .addSubcommand((sub) => sub.setName("close").setDescription("Close the ticket in this channel")),
   execute: async (interaction) => {

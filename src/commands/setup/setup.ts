@@ -104,7 +104,8 @@ export const setupCommand: MarketplaceCommand = {
             .addChoices(
               { name: "Order panel", value: "order" },
               { name: "Ticket (support) panel", value: "ticket" },
-              { name: "Combined panel (both)", value: "all" },
+              { name: "Verification panel", value: "verify" },
+              { name: "Combined panel (all)", value: "all" },
             ),
         ),
     ),

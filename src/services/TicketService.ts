@@ -26,7 +26,17 @@ import { audit } from "./AuditService.js";
  * The database row is the source of truth; the Discord channel is a view.
  */
 
-export type PanelKind = "order" | "support" | "all";
+export type PanelKind = "order" | "support" | "verify" | "all";
+
+const VERIFY_PANEL_DESCRIPTION = [
+  "Link your Roblox account to this server to unlock orders and eligibility tracking.",
+  "",
+  "**How to verify:**",
+  "1. Click **Verify Roblox Account** below.",
+  "2. Enter your Roblox username in the form.",
+  "3. The bot will give you a code — add it to your Roblox profile's *About/Description* and save.",
+  "4. Come back and press **Verify Account** to finish.",
+].join("\n");
 
 export async function publishTicketPanel(guildId: string, kind: PanelKind): Promise<string> {
   const settings = await findSettings(guildId);
@@ -48,12 +58,23 @@ export async function publishTicketPanel(guildId: string, kind: PanelKind): Prom
     });
   }
 
-  const embed = baseEmbed(COLORS.info, settings.marketplaceName)
-    .setTitle("🎫 MARKETPLACE SUPPORT")
-    .setDescription("Need assistance or want to place an order?\nUse the buttons below.");
+  const includeOrder = kind === "order" || kind === "all";
+  const includeSupport = kind === "support" || kind === "all";
+  const includeVerify = kind === "verify" || kind === "all";
+
+  let title = "🎫 MARKETPLACE SUPPORT";
+  let description = "Need assistance or want to place an order?\nUse the buttons below.";
+  if (kind === "verify") {
+    title = "✅ ROBLOX VERIFICATION";
+    description = VERIFY_PANEL_DESCRIPTION;
+  } else if (kind === "all") {
+    description = "Need assistance, want to place an order, or verify your Roblox account?\nUse the buttons below.";
+  }
+
+  const embed = baseEmbed(COLORS.info, settings.marketplaceName).setTitle(title).setDescription(description);
 
   const buttons: ButtonBuilder[] = [];
-  if (kind === "order" || kind === "all") {
+  if (includeOrder) {
     buttons.push(
       new ButtonBuilder()
         .setCustomId(cid(CUSTOM_ID_PREFIX.ticket, "create", "order"))
@@ -62,13 +83,22 @@ export async function publishTicketPanel(guildId: string, kind: PanelKind): Prom
         .setStyle(ButtonStyle.Primary),
     );
   }
-  if (kind === "support" || kind === "all") {
+  if (includeSupport) {
     buttons.push(
       new ButtonBuilder()
         .setCustomId(cid(CUSTOM_ID_PREFIX.ticket, "create", "support"))
         .setLabel("General Support")
         .setEmoji("💬")
         .setStyle(ButtonStyle.Secondary),
+    );
+  }
+  if (includeVerify) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(cid(CUSTOM_ID_PREFIX.verify, "start"))
+        .setLabel("Verify Roblox Account")
+        .setEmoji("✅")
+        .setStyle(ButtonStyle.Success),
     );
   }
 
