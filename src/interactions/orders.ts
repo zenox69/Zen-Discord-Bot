@@ -30,7 +30,6 @@ import {
 } from "../services/OrderService.js";
 import { AppError } from "../utils/errors.js";
 import { clearDefer, deferEphemeral } from "../utils/interactionReply.js";
-import { isStaff } from "../utils/permissions.js";
 import type { InteractionContext } from "../handlers/interactionHandler.js";
 
 /**
@@ -115,11 +114,8 @@ export async function handleContinue(ctx: InteractionContext): Promise<void> {
     include: { product: true, community: true, ticket: true },
   });
   if (!order || order.status !== "DRAFT") throw new AppError({ code: "ORDER_GONE", friendly: "❌ This order no longer exists in draft." });
-  if (
-    order.discordUserId !== formCtx.actorId &&
-    !(formCtx.member && formCtx.settings && isStaff(formCtx.member, formCtx.settings))
-  ) {
-    throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only the ticket owner can continue." });
+  if (order.discordUserId !== formCtx.actorId) {
+    throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only the customer who opened this ticket can continue the order form." });
   }
   await interaction.showModal(buildOrderModal(order));
 }

@@ -99,7 +99,7 @@ function isActorAdmin(ctx: FormCtx): boolean {
   return !!ctx.settings.adminRoleId && ctx.member.roles.cache.has(ctx.settings.adminRoleId);
 }
 
-/** Customer-form permission: ticket owner (or staff). */
+/** Customer-form permission: ticket owner only — staff must not order for a customer. */
 function assertFormAccess(order: OrderWithRelations, ctx: FormCtx): void {
   if (order.guildId !== ctx.guildId) {
     throw new AppError({ code: "WRONG_GUILD", friendly: "❌ This order belongs to a different server.", expected: false });
@@ -107,8 +107,8 @@ function assertFormAccess(order: OrderWithRelations, ctx: FormCtx): void {
   if (order.ticket?.channelId && order.ticket.channelId !== ctx.channelId) {
     throw new AppError({ code: "WRONG_CHANNEL", friendly: "❌ Use the buttons in your own ticket.", expected: false });
   }
-  if (order.discordUserId !== ctx.actorId && !isStaffActor(ctx)) {
-    throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only the ticket owner can fill this form." });
+  if (order.discordUserId !== ctx.actorId) {
+    throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only the customer who opened this ticket can fill this form." });
   }
 }
 
@@ -287,8 +287,8 @@ export async function handleProductSelect(ticketId: number, productValue: string
   if (!ticket || ticket.guildId !== ctx.guildId || ticket.channelId !== ctx.channelId) {
     throw new AppError({ code: "WRONG_CHANNEL", friendly: "❌ Use the form in your own ticket.", expected: false });
   }
-  if (ticket.discordUserId !== ctx.actorId && !isStaffActor(ctx)) {
-    throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only the ticket owner can fill this form." });
+  if (ticket.discordUserId !== ctx.actorId) {
+    throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only the customer who opened this ticket can select products." });
   }
 
   const product = await prisma.product.findUnique({ where: { id: Number(productValue) } });
