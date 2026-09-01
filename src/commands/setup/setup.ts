@@ -95,7 +95,7 @@ export const setupCommand: MarketplaceCommand = {
     .addSubcommand((sub) =>
       sub
         .setName("publish")
-        .setDescription("Publish a panel to the panel channel")
+        .setDescription("Publish a panel to the panel channel (or a specific channel)")
         .addStringOption((o) =>
           o
             .setName("panel")
@@ -107,7 +107,8 @@ export const setupCommand: MarketplaceCommand = {
               { name: "Verification panel", value: "verify" },
               { name: "Combined panel (all)", value: "all" },
             ),
-        ),
+        )
+        .addChannelOption((o) => o.setName("channel").setDescription("Publish to this channel instead of the configured panel channel").addChannelTypes(ChannelType.GuildText)),
     ),
   execute: async (interaction) => {
     const guildId = interaction.guildId;
@@ -296,9 +297,24 @@ export const setupCommand: MarketplaceCommand = {
 
     if (sub === "publish") {
       const panel = (interaction.options.getString("panel") ?? "all") as PanelKind;
-      await publishTicketPanel(guildId, panel);
+      let targetChannelId: string | undefined;
+      const picked = interaction.options.getChannel("channel");
+      if (picked) {
+        if (!(picked instanceof GuildChannel) || picked.guildId !== guildId) {
+          throw new AppError({ code: "WRONG_GUILD_CHANNEL", friendly: "❌ Please provide a channel from this server." });
+        }
+        if (picked.type !== ChannelType.GuildText) {
+          throw new AppError({ code: "NOT_A_TEXT_CHANNEL", friendly: "❌ That channel must be a text channel." });
+        }
+        targetChannelId = picked.id;
+      }
+      const channelId = await publishTicketPanel(guildId, panel, targetChannelId);
       await interaction.reply({
-        embeds: [baseEmbed(COLORS.success, settings.marketplaceName).setTitle("✅ Panel published").setDescription("The panel is now live in the configured panel channel.")],
+        embeds: [
+          baseEmbed(COLORS.success, settings.marketplaceName)
+            .setTitle("✅ Panel published")
+            .setDescription(`The panel is now live in <#${channelId}>.`),
+        ],
       });
       return;
     }

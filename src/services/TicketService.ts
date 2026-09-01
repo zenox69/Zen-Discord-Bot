@@ -38,10 +38,10 @@ const VERIFY_PANEL_DESCRIPTION = [
   "4. Come back and press **Verify Account** to finish.",
 ].join("\n");
 
-export async function publishTicketPanel(guildId: string, kind: PanelKind): Promise<string> {
+export async function publishTicketPanel(guildId: string, kind: PanelKind, targetChannelId?: string): Promise<string> {
   const settings = await findSettings(guildId);
   if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not set up yet — run `/setup`." });
-  const panelChannelId = settings.orderPanelChannelId;
+  const panelChannelId = targetChannelId ?? settings.orderPanelChannelId;
   if (!panelChannelId) {
     throw new AppError({
       code: "NO_PANEL_CHANNEL",
