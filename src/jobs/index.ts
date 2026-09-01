@@ -26,27 +26,27 @@ function guarded(name: string, job: () => Promise<void>): () => void {
   };
 }
 
-function schedule(expression: string, name: string, job: () => Promise<void>): void {
+function schedule(expression: string, name: string, job: () => Promise<void>): () => void {
   if (!cron.validate(expression)) throw new Error(`Invalid ${name} cron expression: ${expression}`);
-  tasks.push(cron.schedule(expression, guarded(name, job)));
+  const guardedJob = guarded(name, job);
+  tasks.push(cron.schedule(expression, guardedJob));
+  return guardedJob;
 }
 
 export function startJobs(client: Client): void {
   if (started) return;
   started = true;
-  schedule(env.CRON_VERIFICATION_SWEEPER, "verification sweeper", sweepExpiredVerifications);
+  const sweep = schedule(env.CRON_VERIFICATION_SWEEPER, "verification sweeper", sweepExpiredVerifications);
   schedule(env.CRON_MEMBERSHIP_REFRESH, "membership refresh", refreshTrackedMemberships);
   schedule(env.CRON_ELIGIBILITY_NOTIFIER, "eligibility notifier", () =>
     notifyNewlyEligible(client),
   );
-  schedule("* * * * *", "ticket recovery", () => recoverTicketChannels(client));
+  const recover = schedule("* * * * *", "ticket recovery", () => recoverTicketChannels(client));
 
-  void sweepExpiredVerifications().catch((error) =>
-    log.error("Initial verification sweep failed", error),
-  );
-  void recoverTicketChannels(client).catch((error) =>
-    log.error("Initial ticket recovery failed", error),
-  );
+  // Startup runs go through the same overlap guards as the cron ticks, so a
+  // slow initial pass can never run concurrently with its first scheduled tick.
+  void sweep();
+  void recover();
   log.info(`Started ${tasks.length} scheduled background jobs.`);
 }
 

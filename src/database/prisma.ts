@@ -1,5 +1,4 @@
 import { PrismaClient } from "@prisma/client";
-import { isProduction } from "../config/env.js";
 
 /**
  * Single Prisma client for the whole process.
@@ -7,5 +6,5 @@ import { isProduction } from "../config/env.js";
  * and membership state. Discord is only the interface.
  */
 export const prisma = new PrismaClient({
-  log: isProduction ? ["error", "warn"] : ["error", "warn"],
+  log: ["warn", "error"],
 });

@@ -4,7 +4,7 @@
 # Build stage — install deps, generate the Prisma client for
 # the target platform (linux), compile TypeScript.
 # ============================================================
-FROM node:20-bookworm AS build
+FROM node:24-bookworm AS build
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -23,7 +23,7 @@ RUN npm run build
 # with node_modules/.prisma, so no network access is needed
 # at runtime to talk to Postgres.
 # ============================================================
-FROM node:20-bookworm-slim AS runtime
+FROM node:24-bookworm-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
@@ -39,5 +39,10 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY prisma ./prisma
 
+# Run as the unprivileged user provided by the official node image.
+USER node
+
 # Migrations run automatically on every deploy/start, then the bot starts.
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]
+# "exec" replaces the shell so node becomes PID 1 and receives SIGTERM
+# directly for graceful shutdown (no orphaned child process).
+CMD ["sh", "-c", "npx prisma migrate deploy && exec node dist/index.js"]

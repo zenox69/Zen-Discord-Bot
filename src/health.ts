@@ -7,7 +7,41 @@ import { log } from "./utils/logger.js";
  * Minimal HTTP health endpoint for platform health checks (Northflank etc.).
  * 200 = Discord connected AND database reachable; 503 otherwise.
  * Port comes from HEALTH_PORT (0 = disabled, e.g. local development).
+ * Never includes credentials, connection strings, or other internal data.
  */
+
+const DB_CHECK_TIMEOUT_MS = 3000;
+
+function checkDatabase(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve(false);
+      }
+    }, DB_CHECK_TIMEOUT_MS);
+    void prisma
+      .$queryRaw`SELECT 1`
+      .then(
+        () => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(true);
+          }
+        },
+        () => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(false);
+          }
+        },
+      );
+  });
+}
+
 export function startHealthServer(port: number): Server | null {
   if (port <= 0) return null;
 
@@ -20,17 +54,13 @@ export function startHealthServer(port: number): Server | null {
     void (async () => {
       let healthy = false;
       try {
-        const dbOk = await Promise.race([
-          prisma.$queryRaw`SELECT 1`.then(() => true),
-          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000)),
-        ]);
         let discordOk = false;
         try {
           discordOk = getBotClient().isReady();
         } catch {
           discordOk = false;
         }
-        healthy = dbOk && discordOk;
+        healthy = discordOk && (await checkDatabase());
       } catch {
         healthy = false;
       }

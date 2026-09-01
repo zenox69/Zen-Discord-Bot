@@ -18,6 +18,8 @@ const envSchema = z.object({
 
   ROBLOX_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30000).default(10000),
   ROBLOX_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
+
+  HEALTH_PORT: z.coerce.number().int().min(0).max(65535).default(3000),
 });
 
 const parsed = envSchema.safeParse(process.env);

@@ -18,7 +18,7 @@ Built with TypeScript (strict), discord.js v14, PostgreSQL, and Prisma. All work
 
 ## Requirements
 
-- Node.js >= 20
+- Node.js >= 24 (LTS)
 - PostgreSQL 13+
 - A Discord application with a bot token (no privileged gateway intents required)
 
@@ -215,7 +215,16 @@ npm test               # vitest (unit tests; no database needed)
 npm run prisma:studio  # browse the database
 ```
 
-Tests cover the order state machine, input sanitization, rate limiting, custom-id grammar, and the Roblox API client (mocked fetch: retry, 404 handling, malformed-JSON rejection).
+Tests cover the order state machine, input sanitization, rate limiting, custom-id grammar, bulk-product parsing, permission helpers, and the Roblox API client (mocked fetch: retry, 404 handling, malformed-JSON rejection).
+
+### CI (GitHub Actions)
+
+`.github/workflows/ci.yml` runs on every push and pull request with Node.js 24:
+
+1. `npm ci`, `npm run typecheck`, `npm run lint`, `npm test`, `npm run build`
+2. `docker build -t zen-discord-bot .` (verifies the production image builds)
+
+No Discord or database secrets are required for CI — the unit tests are database-independent.
 
 ## Troubleshooting
 
