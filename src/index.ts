@@ -10,7 +10,8 @@ import { reportError } from "./utils/errorBoundary.js";
 import { log } from "./utils/logger.js";
 import { setBotClient } from "./utils/botClient.js";
 import { stopJobs } from "./jobs/index.js";
-import { startHealthServer } from "./health.js";
+import { closeHealthServer, startHealthServer } from "./health.js";
+import { createShutdown } from "./lifecycle.js";
 
 /**
  * Entry point. No privileged gateway intents are required — the bot works
@@ -35,53 +36,52 @@ client.on("error", (err) => log.error("Discord client error", err));
 client.on("warn", (msg) => log.warn(`Discord client warning: ${msg}`));
 client.on("shardDisconnect", () => log.warn("Shard disconnected — reconnecting..."));
 client.on("shardReady", () => log.info("Shard ready — Discord connection (re)established."));
-client.on("invalidated", () => {
-  // Token was revoked/changed or the session was invalidated by Discord.
-  // A restart cannot fix this; exit so the supervisor alerts the operator.
-  log.error("Discord session invalidated — exiting for supervised restart.");
-  process.exit(1);
-});
-
-process.on("unhandledRejection", (reason) => {
-  const err = reason instanceof Error ? reason : new Error(String(reason));
-  // All state lives in Postgres, so crash + supervised restart is safe.
-  // Never swallow: report it, then exit so the platform restarts us.
-  log.error("Unhandled promise rejection — exiting for supervised restart", err);
-  const backstop = setTimeout(() => process.exit(1), 5000);
-  backstop.unref();
-  void reportError(err, {})
-    .catch(() => undefined)
-    .finally(() => process.exit(1));
-});
-
-process.on("uncaughtException", (err) => {
-  // All workflow state lives in Postgres, so crash + supervised restart is safe.
-  log.error("Uncaught exception — process will exit for supervised restart", err);
-  process.exit(1);
-});
-
-let shuttingDown = false;
-async function shutdown(signal: string): Promise<void> {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  log.info(`${signal} received — shutting down gracefully...`);
-  // Hard backstop: if any teardown step hangs, the platform's kill -9 wins
-  // instead of the container hanging past its termination grace period.
-  const backstop = setTimeout(() => process.exit(1), 10000);
-  backstop.unref();
-  stopJobs();
-  healthServer?.close();
-  client.destroy();
-  await prisma.$disconnect().catch(() => undefined);
-  log.info("Shutdown complete.");
-  process.exit(0);
-}
-process.on("SIGINT", () => void shutdown("SIGINT"));
-process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 // Health endpoint first, so the platform can probe from the start
 // (503 until Discord and the database are both ready).
 const healthServer = startHealthServer(env.HEALTH_PORT);
+
+// One guarded shutdown routine for every exit path (see lifecycle.ts).
+const shutdown = createShutdown({
+  stopJobs,
+  closeHealth: () => closeHealthServer(healthServer),
+  destroyClient: () => client.destroy(),
+  disconnectDb: () => prisma.$disconnect(),
+  exit: (code) => process.exit(code),
+});
+
+client.on("invalidated", () => {
+  // Token was revoked/changed or the session was invalidated by Discord.
+  // A restart cannot fix this; exit so the supervisor alerts the operator.
+  // The gateway session is already dead, so graceful local cleanup is safe.
+  log.error("Discord session invalidated — exiting for supervised restart.");
+  void shutdown("invalidated", 1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  // All state lives in Postgres, so cleanup + supervised restart is safe.
+  // Never swallow: report it (bounded so a hung webhook can't block the
+  // exit), then run the graceful shutdown with failure status.
+  log.error("Unhandled promise rejection — exiting for supervised restart", err);
+  const deadline = new Promise<void>((resolve) => {
+    setTimeout(resolve, 5000).unref();
+  });
+  void Promise.race([reportError(err, {}).catch(() => undefined), deadline])
+    .finally(() => void shutdown("unhandledRejection", 1));
+});
+
+process.on("uncaughtException", (err) => {
+  // Deliberately NOT graceful: after an uncaught exception the process state
+  // may be corrupt, and async cleanup could hang or make things worse.
+  // Crash fast and let the supervisor restart; all workflow state lives in
+  // Postgres.
+  log.error("Uncaught exception — process will exit for supervised restart", err);
+  process.exit(1);
+});
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 // Startup database check (non-fatal): make "database unreachable" immediately
 // visible in the logs. The bot keeps running; the health endpoint reports
@@ -100,5 +100,6 @@ void (async () => {
 
 client.login(env.DISCORD_TOKEN).catch((err) => {
   log.error("Failed to log in to Discord", err);
-  process.exit(1);
+  // Health server and Prisma may already be up — clean them up before exit.
+  void shutdown("login failure", 1);
 });

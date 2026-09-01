@@ -73,3 +73,17 @@ export function startHealthServer(port: number): Server | null {
   server.listen(port, "0.0.0.0", () => log.info(`Health endpoint listening on :${port}/healthz`));
   return server;
 }
+
+/**
+ * Await graceful close of the health server. Resolves immediately when the
+ * server is disabled (null). Never rejects — shutdown must not be blocked by
+ * a close failure. Idle keep-alive sockets (platform probes) are force-closed
+ * so close() doesn't wait for them to time out.
+ */
+export function closeHealthServer(server: Server | null): Promise<void> {
+  if (!server) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    server.closeIdleConnections();
+  });
+}
