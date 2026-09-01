@@ -4,7 +4,6 @@ import type { GuildSettings } from "@prisma/client";
 import { AppError, RobloxApiError } from "../src/utils/errors.js";
 import type { EligibilityEntry } from "../src/services/EligibilityService.js";
 import type { FormCtx, OrderWithRelations } from "../src/services/OrderService.js";
-
 const mocks = vi.hoisted(() => {
   const tx = {
     guildSettings: { update: vi.fn() },
@@ -43,7 +42,15 @@ vi.mock("../src/utils/rateLimiter.js", () => ({
   retryPhrase: (ms: number) => `Try again in ${Math.ceil(ms / 1000)}s`,
 }));
 
-import { claimOrder, setOrderPrice, submitOrder } from "../src/services/OrderService.js";
+import {
+  applyStatus,
+  buildOrderStaffControls,
+  cancelOrder,
+  claimOrder,
+  parsePriceInput,
+  setOrderPrice,
+  submitOrder,
+} from "../src/services/OrderService.js";
 
 function makeOrder(overrides: Record<string, unknown> = {}): OrderWithRelations {
   return {
@@ -58,6 +65,7 @@ function makeOrder(overrides: Record<string, unknown> = {}): OrderWithRelations 
     quantity: 1,
     assignedStaffId: null,
     orderMessageId: null,
+    updatedAt: new Date("2026-09-01T00:00:00.000Z"),
     ticket: { id: 5, channelId: "c-1" },
     product: { id: 10, name: "Boost", requiresEligibility: true, enabled: true, minQuantity: 1, maxQuantity: null },
     community: { id: 20, name: "Community A", enabled: true, requiredDays: 7 },
@@ -187,21 +195,26 @@ describe("setOrderPrice", () => {
   it("rejects pricing an unclaimed SUBMITTED order (claim first)", async () => {
     mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "SUBMITTED" }));
     await expect(setOrderPrice(1, 500, staff)).rejects.toMatchObject({
-      code: "BAD_TRANSITION",
-      friendly: expect.stringContaining("Claim the order first"),
+      code: "NOT_ASSIGNED",
+      friendly: expect.stringContaining("Claim the order"),
     });
     expect(mocks.tx.order.updateMany).not.toHaveBeenCalled();
   });
 
-  it("sets price on STAFF_REVIEW and moves the order to QUOTED", async () => {
-    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW", assignedStaffId: "staff-1" }));
+  it("sets price on STAFF_REVIEW and moves the order to QUOTED (updatedAt lock)", async () => {
+    const updatedAt = new Date("2026-09-01T00:00:00.000Z");
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW", assignedStaffId: "staff-1", updatedAt }));
     mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
 
     await setOrderPrice(1, 750, staff);
 
     expect(mocks.tx.order.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 1, status: "STAFF_REVIEW" },
+        where: expect.objectContaining({
+          id: 1,
+          status: "STAFF_REVIEW",
+          updatedAt,
+        }),
         data: { price: 750, status: "QUOTED" },
       }),
     );
@@ -234,26 +247,41 @@ describe("setOrderPrice", () => {
   });
 
   it("rejects non-staff", async () => {
-    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW" }));
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW", assignedStaffId: "staff-1" }));
     await expect(setOrderPrice(1, 500, customer)).rejects.toMatchObject({ code: "NOT_STAFF" });
+  });
+
+  it("blocks a different staff member from editing a claimed order (admin can)", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "QUOTED", assignedStaffId: "staff-2" }));
+    await expect(setOrderPrice(1, 500, staff)).rejects.toMatchObject({ code: "NOT_ASSIGNED" });
+    expect(mocks.tx.order.updateMany).not.toHaveBeenCalled();
+
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "QUOTED", assignedStaffId: "staff-2" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
+    await expect(setOrderPrice(1, 500, admin)).resolves.toBeUndefined();
+    expect(mocks.tx.order.updateMany).toHaveBeenCalled();
   });
 
   it("rejects invalid states", async () => {
     for (const status of ["DRAFT", "PAID", "COMPLETED"]) {
-      mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status }));
+      mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status, assignedStaffId: "staff-1" }));
       await expect(setOrderPrice(1, 500, staff)).rejects.toMatchObject({ code: "BAD_TRANSITION" });
     }
   });
 
-  it("duplicate/concurrent price set — count 0 is rejected", async () => {
-    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW" }));
+  it("stale/concurrent price edit — updatedAt mismatch (count 0) is rejected with no audit", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "QUOTED", assignedStaffId: "staff-1" }));
     mocks.tx.order.updateMany.mockResolvedValue({ count: 0 });
-    await expect(setOrderPrice(1, 500, staff)).rejects.toMatchObject({ code: "BAD_TRANSITION" });
+    await expect(setOrderPrice(1, 700, staff)).rejects.toMatchObject({
+      code: "STALE_ORDER",
+      friendly: expect.stringContaining("modified by another staff member"),
+    });
     expect(mocks.tx.orderEvent.create).not.toHaveBeenCalled();
+    expect(mocks.audit).not.toHaveBeenCalled();
   });
 
   it("rejects malformed prices", async () => {
-    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW" }));
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW", assignedStaffId: "staff-1" }));
     await expect(setOrderPrice(1, -5, staff)).rejects.toMatchObject({ code: "INVALID_PRICE" });
     await expect(setOrderPrice(1, Number.NaN, staff)).rejects.toMatchObject({ code: "INVALID_PRICE" });
   });
@@ -282,7 +310,7 @@ describe("submitOrder", () => {
     expect(mocks.getCommunityEligibility).toHaveBeenCalledWith("g-1", "202", 20, { forceRefresh: true });
     expect(mocks.tx.order.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 1, status: "DRAFT" },
+        where: expect.objectContaining({ id: 1, status: "DRAFT", updatedAt: expect.anything() }),
         data: expect.objectContaining({
           status: "SUBMITTED",
           number: "000002",
@@ -290,6 +318,36 @@ describe("submitOrder", () => {
         }),
       }),
     );
+  });
+
+  it("preserves full eligibility context in the final snapshot", async () => {
+    const eligibleAt = new Date("2026-08-25T00:00:00.000Z");
+    const membershipStartedAt = new Date("2026-06-01T00:00:00.000Z");
+    mocks.prisma.order.findUnique.mockResolvedValue(draftOrder());
+    mocks.getCommunityEligibility.mockResolvedValue({
+      community: { id: 20, requiredDays: 7 },
+      membership: { membershipStartedAt, membershipDateSource: "FIRST_SEEN" },
+      status: "ELIGIBLE",
+      eligibleAt,
+      daysRemaining: 0,
+    } as unknown as EligibilityEntry);
+    mocks.tx.guildSettings.update.mockResolvedValue({ orderCounter: 5 });
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
+    mocks.tx.order.findUniqueOrThrow.mockResolvedValue(makeOrder({ status: "SUBMITTED", number: "0005" }));
+
+    await submitOrder(1, customer);
+
+    const data = mocks.tx.order.updateMany.mock.calls[0]![0].data as { eligibilitySnapshot: Record<string, unknown> };
+    expect(data.eligibilitySnapshot).toEqual({
+      status: "ELIGIBLE",
+      eligibleAt: eligibleAt.toISOString(),
+      checkedAt: expect.any(String),
+      communityId: 20,
+      robloxUserId: "202",
+      membershipStartedAt: membershipStartedAt.toISOString(),
+      membershipDateSource: "FIRST_SEEN",
+      requiredDays: 7,
+    });
   });
 
   it("user became ineligible before submit — order is NOT submitted, draft kept", async () => {
@@ -374,5 +432,155 @@ describe("submitOrder", () => {
     mocks.prisma.order.findUnique.mockResolvedValue(draftOrder());
     await expect(submitOrder(1, staff)).rejects.toBeInstanceOf(AppError);
     expect(mocks.getCommunityEligibility).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 2 — AWAITING_PAYMENT is reachable
+// ---------------------------------------------------------------------------
+
+describe("applyStatus — await payment flow", () => {
+  it("moves QUOTED -> AWAITING_PAYMENT", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "QUOTED", assignedStaffId: "staff-1" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
+
+    await applyStatus(1, "AWAITING_PAYMENT", staff);
+
+    expect(mocks.tx.order.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 1, status: "QUOTED", updatedAt: expect.anything() }),
+        data: { status: "AWAITING_PAYMENT" },
+      }),
+    );
+    expect(mocks.tx.orderEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ type: "AWAITING_PAYMENT", fromStatus: "QUOTED" }) }),
+    );
+    expect(mocks.audit).toHaveBeenCalledWith(expect.objectContaining({ action: "STATUS_AWAITING_PAYMENT" }));
+  });
+
+  it("moves AWAITING_PAYMENT -> PAID", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "AWAITING_PAYMENT", assignedStaffId: "staff-1" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
+
+    await applyStatus(1, "PAID", staff);
+
+    expect(mocks.tx.order.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { status: "PAID" } }),
+    );
+  });
+
+  it("duplicate button press — count 0 rejected with no event/audit", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "AWAITING_PAYMENT", assignedStaffId: "staff-1" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(applyStatus(1, "PAID", staff)).rejects.toMatchObject({ code: "STALE_ORDER" });
+    expect(mocks.tx.orderEvent.create).not.toHaveBeenCalled();
+    expect(mocks.audit).not.toHaveBeenCalled();
+  });
+
+  it("blocks a non-assigned staff member; admin override works", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "AWAITING_PAYMENT", assignedStaffId: "staff-2" }));
+    await expect(applyStatus(1, "PAID", staff)).rejects.toMatchObject({ code: "NOT_ASSIGNED" });
+
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "AWAITING_PAYMENT", assignedStaffId: "staff-2" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
+    await expect(applyStatus(1, "PAID", admin)).resolves.toBeUndefined();
+  });
+
+  it("assigned staff member can act", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "PAID", assignedStaffId: "staff-1" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
+    await expect(applyStatus(1, "IN_PROGRESS", staff)).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 6 — claim ownership on cancel
+// ---------------------------------------------------------------------------
+
+describe("cancelOrder ownership", () => {
+  it("blocks unassigned staff from cancelling someone else's order", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW", assignedStaffId: null }));
+    await expect(cancelOrder("1", staff, "reason")).rejects.toMatchObject({ code: "NOT_ASSIGNED" });
+    expect(mocks.tx.order.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("blocks a different staff member; admin override works", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW", assignedStaffId: "staff-2" }));
+    await expect(cancelOrder("1", staff, "reason")).rejects.toMatchObject({ code: "NOT_ASSIGNED" });
+
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW", assignedStaffId: "staff-2" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
+    mocks.tx.order.findUniqueOrThrow.mockResolvedValue(makeOrder({ status: "CANCELLED" }));
+    await expect(cancelOrder("1", admin, "reason")).resolves.toBeUndefined();
+  });
+
+  it("customer can still cancel their own order", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "SUBMITTED", assignedStaffId: "staff-2" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
+    mocks.tx.order.findUniqueOrThrow.mockResolvedValue(makeOrder({ status: "CANCELLED" }));
+    await expect(cancelOrder("1", customer, "changed my mind")).resolves.toBeUndefined();
+    expect(mocks.tx.order.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ status: "SUBMITTED", updatedAt: expect.anything() }) }),
+    );
+  });
+
+  it("duplicate cancel — count 0 rejected", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "SUBMITTED" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 0 });
+    await expect(cancelOrder("1", customer, "reason")).rejects.toMatchObject({ code: "STALE_ORDER" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 3 — state-aware buttons
+// ---------------------------------------------------------------------------
+
+describe("buildOrderStaffControls", () => {
+  function labelsFor(status: string, assignedStaffId: string | null = "staff-1"): string[] {
+    const rows = buildOrderStaffControls(makeOrder({ status, assignedStaffId }));
+    const labels: string[] = [];
+    for (const row of rows) {
+      for (const component of row.components) {
+        const data = (component as unknown as { data: { label?: string; disabled?: boolean } }).data;
+        if (data.label && !data.disabled) labels.push(data.label);
+      }
+    }
+    return labels;
+  }
+
+  it("shows only valid actions per status", () => {
+    expect(labelsFor("SUBMITTED", null)).toEqual(["Claim", "Cancel", "Close"]);
+    expect(labelsFor("STAFF_REVIEW")).toEqual(["Set Price", "Cancel", "Close"]);
+    expect(labelsFor("QUOTED")).toEqual(["Edit Price", "Await Payment", "Cancel", "Close"]);
+    expect(labelsFor("AWAITING_PAYMENT")).toEqual(["Edit Price", "Mark Paid", "Cancel", "Close"]);
+    expect(labelsFor("PAID")).toEqual(["Start", "Cancel", "Close"]);
+    expect(labelsFor("IN_PROGRESS")).toEqual(["Ready", "Cancel", "Close"]);
+    expect(labelsFor("READY")).toEqual(["Complete", "Cancel", "Close"]);
+    expect(labelsFor("COMPLETED")).toEqual(["Close"]);
+    expect(labelsFor("CANCELLED")).toEqual(["Close"]);
+    expect(labelsFor("REFUNDED")).toEqual(["Close"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 5 — strict price parsing
+// ---------------------------------------------------------------------------
+
+describe("parsePriceInput", () => {
+  it("accepts valid plain money values", () => {
+    expect(parsePriceInput("500")).toBe(500);
+    expect(parsePriceInput("500.00")).toBe(500);
+    expect(parsePriceInput("0")).toBe(0);
+    expect(parsePriceInput("0.50")).toBe(0.5);
+    expect(parsePriceInput("1250.5")).toBe(1250.5);
+    expect(parsePriceInput("  750  ")).toBe(750);
+  });
+
+  it("rejects invalid input", () => {
+    for (const bad of ["abc", "500abc", "₱500", "..", "1.2.3", "-", "", "  ", "NaN", "Infinity", "1e3", "-5", "12,50", "0x10"]) {
+      expect(() => parsePriceInput(bad)).toThrowError(AppError);
+    }
+    expect(() => parsePriceInput("abc")).toThrowError(/Invalid price/);
   });
 });

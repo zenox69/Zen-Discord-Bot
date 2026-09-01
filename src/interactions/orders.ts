@@ -21,6 +21,7 @@ import {
   handleBack,
   handleCommunitySelect,
   handleProductSelect,
+  parsePriceInput,
   setOrderPrice,
   submitOrder,
   submitOrderModal,
@@ -234,12 +235,12 @@ export async function submitSetPriceModal(ctx: InteractionContext): Promise<void
   const formCtx = await getStaffContext(interaction);
   const orderId = Number(ctx.parts[0]);
   const raw = interaction.fields.getTextInputValue("price") ?? "";
-  const price = Number(raw.replace(/[^0-9.]/g, ""));
+  const price = parsePriceInput(raw);
   await setOrderPrice(orderId, price, formCtx);
-  await interaction.reply({ content: `✅ Price set to **${price}** (order moved to QUOTED).`, ephemeral: true });
+  await interaction.reply({ content: `✅ Price set to **${price}**.`, ephemeral: true });
 }
 
-const STATUS_TARGET = { paid: "PAID", start: "IN_PROGRESS", ready: "READY" } as const;
+const STATUS_TARGET = { paid: "PAID", await: "AWAITING_PAYMENT", start: "IN_PROGRESS", ready: "READY" } as const;
 
 export async function handleStatus(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;

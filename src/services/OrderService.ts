@@ -112,6 +112,42 @@ function assertFormAccess(order: OrderWithRelations, ctx: FormCtx): void {
   }
 }
 
+/**
+ * Claim ownership: once an order is claimed, only the ASSIGNED staff member
+ * or an administrator may modify it (price, status, cancel). Other staff are
+ * blocked. Orders are claimed via claimOrder; unassigned SUBMITTED orders
+ * accept a claim from any staff member there.
+ */
+function assertStaffCanManage(order: OrderWithRelations, ctx: FormCtx): void {
+  if (!isStaffActor(ctx)) throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can modify orders." });
+  if (isActorAdmin(ctx)) return;
+  if (order.assignedStaffId === ctx.actorId) return;
+  if (order.assignedStaffId) {
+    throw new AppError({
+      code: "NOT_ASSIGNED",
+      friendly: `❌ This order is assigned to <@${order.assignedStaffId}>. Only they (or an administrator) can modify it.`,
+    });
+  }
+  throw new AppError({ code: "NOT_ASSIGNED", friendly: "❌ Claim the order before modifying it." });
+}
+
+/**
+ * Strict money input: digits with at most 2 decimals, plain and unsigned.
+ * Accepts 500, 500.00, 0, 0.50, 1250.5 — rejects abc, 500abc, ₱500, "..",
+ * 1.2.3, "-", empty, and anything Number() cannot represent finitely.
+ */
+export function parsePriceInput(raw: string): number {
+  const text = raw.trim();
+  if (!/^\d+(\.\d{1,2})?$/.test(text)) {
+    throw new AppError({ code: "INVALID_PRICE", friendly: "❌ Invalid price. Enter a plain number like **500** or **500.50** (no currency symbols, at most 2 decimals)." });
+  }
+  const price = Number(text);
+  if (!Number.isFinite(price) || price < 0) {
+    throw new AppError({ code: "INVALID_PRICE", friendly: "❌ Invalid price. Enter a plain number like **500** or **500.50**." });
+  }
+  return price;
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -152,37 +188,66 @@ export async function renderOrderEmbed(order: OrderWithRelations): Promise<Embed
   return embed;
 }
 
-export function staffControlRow(order: OrderWithRelations): ActionRowBuilder<ButtonBuilder>[] {
-  const b = (action: string, label: string, emoji: string, style: ButtonStyle, disabled = false) =>
+/**
+ * State-aware staff controls: only valid actions for the current status.
+ * Backend validation in the service layer remains the authority — hidden
+ * buttons are UX, not security.
+ *
+ * SUBMITTED        [Claim] [Cancel]
+ * STAFF_REVIEW     [Set Price] [Cancel]
+ * QUOTED           [Edit Price] [Await Payment] [Cancel]
+ * AWAITING_PAYMENT [Edit Price] [Mark Paid] [Cancel]
+ * PAID             [Start] [Cancel]
+ * IN_PROGRESS      [Ready] [Cancel]
+ * READY            [Complete] [Cancel]
+ * COMPLETED / CANCELLED / REFUNDED — no order workflow buttons (Close only)
+ */
+export function buildOrderStaffControls(order: OrderWithRelations): ActionRowBuilder<ButtonBuilder>[] {
+  const b = (action: string, label: string, emoji: string, style: ButtonStyle) =>
     new ButtonBuilder()
       .setCustomId(cid(CUSTOM_ID_PREFIX.order, action, order.id))
       .setLabel(label)
       .setEmoji(emoji)
-      .setStyle(style)
-      .setDisabled(disabled);
+      .setStyle(style);
 
-  return [
+  const workflow: ButtonBuilder[] = (() => {
+    const cancel = () => b("cancel-order", "Cancel", "❌", ButtonStyle.Danger);
+    switch (order.status) {
+      case "SUBMITTED":
+        return [b("claim", "Claim", "👤", ButtonStyle.Primary), cancel()];
+      case "STAFF_REVIEW":
+        return [b("set-price", "Set Price", "💰", ButtonStyle.Secondary), cancel()];
+      case "QUOTED":
+        return [b("set-price", "Edit Price", "💰", ButtonStyle.Secondary), b("status:await", "Await Payment", "💳", ButtonStyle.Secondary), cancel()];
+      case "AWAITING_PAYMENT":
+        return [b("set-price", "Edit Price", "💰", ButtonStyle.Secondary), b("status:paid", "Mark Paid", "✅", ButtonStyle.Success), cancel()];
+      case "PAID":
+        return [b("status:start", "Start", "🔨", ButtonStyle.Secondary), cancel()];
+      case "IN_PROGRESS":
+        return [b("status:ready", "Ready", "📦", ButtonStyle.Secondary), cancel()];
+      case "READY":
+        return [b("status:complete", "Complete", "✅", ButtonStyle.Success), cancel()];
+      default:
+        return [];
+    }
+  })();
+
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+  if (workflow.length > 0) {
+    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(...workflow));
+  }
+  rows.push(
     new ActionRowBuilder<ButtonBuilder>().addComponents(
-      b("claim", "Claim", "👤", ButtonStyle.Primary, order.assignedStaffId !== null && order.status !== "SUBMITTED"),
-      b("set-price", "Set Price", "💰", ButtonStyle.Secondary),
-      b("status:paid", "Mark Paid", "✅", ButtonStyle.Success),
-    ),
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      b("status:start", "Start", "🔨", ButtonStyle.Secondary),
-      b("status:ready", "Ready", "📦", ButtonStyle.Secondary),
-      b("status:complete", "Complete", "✅", ButtonStyle.Success),
-    ),
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      b("cancel-order", "Cancel", "❌", ButtonStyle.Danger),
       order.ticket
         ? new ButtonBuilder()
             .setCustomId(cid(CUSTOM_ID_PREFIX.ticket, "close", order.ticket.id))
             .setLabel("Close")
             .setEmoji("🔒")
             .setStyle(ButtonStyle.Danger)
-        : b("noop", "Close", "🔒", ButtonStyle.Danger, true),
+        : new ButtonBuilder().setCustomId(cid(CUSTOM_ID_PREFIX.order, "noop", "0")).setLabel("Close").setEmoji("🔒").setStyle(ButtonStyle.Danger).setDisabled(true),
     ),
-  ];
+  );
+  return rows;
 }
 
 async function refreshOrderMessage(order: OrderWithRelations): Promise<void> {
@@ -196,7 +261,7 @@ async function refreshOrderMessage(order: OrderWithRelations): Promise<void> {
   if (!channel.messages) return;
   const message = await channel.messages.fetch(order.orderMessageId).catch(() => null);
   if (!message) return;
-  await message.edit({ embeds: [await renderOrderEmbed(order)], components: staffControlRow(order) }).catch(() => undefined);
+  await message.edit({ embeds: [await renderOrderEmbed(order)], components: buildOrderStaffControls(order) }).catch(() => undefined);
 }
 
 // ---------------------------------------------------------------------------
@@ -684,12 +749,36 @@ export type SubmitResult =
  * we re-sync live memberships (forceRefresh) before DRAFT → SUBMITTED.
  *
  * Outcomes:
- *  - still eligible  → fresh snapshot written, order submitted
+ *  - still eligible  → fresh snapshot returned; caller persists it in the
+ *                      submit transaction
  *  - no longer eligible → order stays DRAFT, caller renders the retry UI
  *  - RoProxy unavailable → AppError (NOT treated as ineligible), draft kept
+ *
+ * The snapshot is HISTORICAL: it describes the eligibility state that allowed
+ * this order to be submitted. It never replaces future live checks.
  */
-async function revalidateEligibility(order: OrderWithRelations, ctx: FormCtx): Promise<SubmitResult | null> {
-  if (!order.product.requiresEligibility) return null;
+type RevalidationOutcome = {
+  /** Fresh snapshot to persist (null when eligibility is not required). */
+  snapshot: Prisma.InputJsonValue | null;
+  /** Non-null = do not submit; render this result instead. */
+  blocked: SubmitResult | null;
+};
+
+function buildEligibilitySnapshot(order: OrderWithRelations, entry: EligibilityEntry): Prisma.InputJsonValue {
+  return {
+    status: entry.status,
+    eligibleAt: entry.eligibleAt?.toISOString() ?? null,
+    checkedAt: new Date().toISOString(),
+    communityId: order.community?.id ?? null,
+    robloxUserId: order.robloxUserId,
+    membershipStartedAt: entry.membership?.membershipStartedAt.toISOString() ?? null,
+    membershipDateSource: entry.membership?.membershipDateSource ?? null,
+    requiredDays: order.community?.requiredDays ?? null,
+  };
+}
+
+async function revalidateEligibility(order: OrderWithRelations, ctx: FormCtx): Promise<RevalidationOutcome> {
+  if (!order.product.requiresEligibility) return { snapshot: null, blocked: null };
 
   if (!order.product.enabled) {
     throw new AppError({ code: "PRODUCT_GONE", friendly: "❌ This product is no longer available. Choose another one." });
@@ -714,27 +803,24 @@ async function revalidateEligibility(order: OrderWithRelations, ctx: FormCtx): P
     throw err;
   }
 
-  const freshSnapshot = entry
-    ? {
-        status: entry.status,
-        eligibleAt: entry.eligibleAt?.toISOString() ?? null,
-        checkedAt: new Date().toISOString(),
-      }
-    : null;
+  const snapshot = entry ? buildEligibilitySnapshot(order, entry) : null;
 
   if (entry?.status === "ELIGIBLE") {
-    return null; // eligible — caller proceeds; snapshot written inside the tx
+    return { snapshot, blocked: null };
   }
 
   // No longer eligible: keep the draft, but record the current truth.
-  if (freshSnapshot) {
-    await prisma.order.update({ where: { id: order.id }, data: { eligibilitySnapshot: freshSnapshot } });
+  if (snapshot) {
+    await prisma.order.update({ where: { id: order.id }, data: { eligibilitySnapshot: snapshot } });
   }
   let detail = entry ? eligibilityStatusLabel(entry.status) : "Community membership not found";
   if (entry?.status === "NOT_ELIGIBLE" && entry.daysRemaining !== null) {
     detail = `${detail} — ${entry.daysRemaining} days remaining`;
   }
-  return { ok: false, reason: "ELIGIBILITY_CHANGED", communityName: order.community.name, detail };
+  return {
+    snapshot: null,
+    blocked: { ok: false, reason: "ELIGIBILITY_CHANGED", communityName: order.community.name, detail },
+  };
 }
 
 export async function submitOrder(orderId: number, ctx: FormCtx): Promise<SubmitResult> {
@@ -747,7 +833,7 @@ export async function submitOrder(orderId: number, ctx: FormCtx): Promise<Submit
   assertFormAccess(order, ctx);
 
   const revalidation = await revalidateEligibility(order, ctx);
-  if (revalidation) return revalidation;
+  if (revalidation.blocked) return revalidation.blocked;
 
   const submitted = await prisma.$transaction(async (tx) => {
     const incremented = await tx.guildSettings.update({
@@ -757,14 +843,12 @@ export async function submitOrder(orderId: number, ctx: FormCtx): Promise<Submit
     // Conditional update: a duplicate/concurrent submit sees count 0 and the
     // whole transaction (including the counter bump) rolls back.
     const updated = await tx.order.updateMany({
-      where: { id: order.id, status: "DRAFT" },
+      where: { id: order.id, status: "DRAFT", updatedAt: order.updatedAt },
       data: {
         status: "SUBMITTED",
         number: zeroPad(incremented.orderCounter),
         submittedAt: new Date(),
-        ...(order.product.requiresEligibility
-          ? { eligibilitySnapshot: { status: "ELIGIBLE", checkedAt: new Date().toISOString() } }
-          : {}),
+        ...(revalidation.snapshot ? { eligibilitySnapshot: revalidation.snapshot } : {}),
       },
     });
     if (updated.count === 0) {
@@ -803,7 +887,7 @@ export async function submitOrder(orderId: number, ctx: FormCtx): Promise<Submit
         .send({
           content: `<@${order.discordUserId}>`,
           embeds: [await renderOrderEmbed(withRelations)],
-          components: staffControlRow(withRelations),
+          components: buildOrderStaffControls(withRelations),
         })
         .catch(() => null)) as { id?: string } | null;
       if (sent?.id) {
@@ -848,15 +932,21 @@ export async function cancelOrder(orderIdOrTicketRef: string, ctx: FormCtx, reas
   if (order.discordUserId !== ctx.actorId && !staff) {
     throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only staff can cancel someone else's order." });
   }
+  // Staff cancelling someone else's order must own it (assigned or admin).
+  // Customer-side cancellation of their own order is unchanged.
+  if (order.discordUserId !== ctx.actorId) {
+    assertStaffCanManage(order, ctx);
+  }
 
   const updated = await prisma.$transaction(async (tx) => {
-    // Conditional update: a duplicate/concurrent cancel sees count 0.
+    // Conditional update (expected status + updatedAt): a duplicate/concurrent
+    // cancel sees count 0.
     const u = await tx.order.updateMany({
-      where: { id: order.id, status: order.status },
+      where: { id: order.id, status: order.status, updatedAt: order.updatedAt },
       data: { status: "CANCELLED", cancelledAt: new Date(), cancelReason: reason ?? null },
     });
     if (u.count === 0) {
-      throw new AppError({ code: "BAD_TRANSITION", friendly: "❌ This order was just updated by someone else." });
+      throw new AppError({ code: "STALE_ORDER", friendly: "❌ Order was modified by another staff member. Refresh and try again." });
     }
     await tx.orderEvent.create({
       data: {
@@ -950,7 +1040,7 @@ export async function setOrderPrice(orderId: number, newPrice: number, ctx: Form
   }
   const order = await fetchOrder(orderId);
   if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ Order not found." });
-  if (!isStaffActor(ctx)) throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can set prices." });
+  assertStaffCanManage(order, ctx);
   // Intended flow: SUBMITTED → Claim → STAFF_REVIEW → Set Price → QUOTED.
   // QUOTED → QUOTED is a price adjustment (recorded in order events + audit).
   if (order.status !== "STAFF_REVIEW" && order.status !== "QUOTED") {
@@ -961,13 +1051,18 @@ export async function setOrderPrice(orderId: number, newPrice: number, ctx: Form
   }
 
   await prisma.$transaction(async (tx) => {
-    // Conditional update: a duplicate/concurrent price set sees count 0.
+    // Optimistic lock on updatedAt: a same-status (QUOTED -> QUOTED) price
+    // edit must not silently overwrite a change another staff member just
+    // made. count 0 = someone modified the order after we loaded it.
     const updated = await tx.order.updateMany({
-      where: { id: order.id, status: order.status },
+      where: { id: order.id, status: order.status, updatedAt: order.updatedAt },
       data: { price: newPrice, status: "QUOTED" },
     });
     if (updated.count === 0) {
-      throw new AppError({ code: "BAD_TRANSITION", friendly: "❌ This order was just updated by another staff member." });
+      throw new AppError({
+        code: "STALE_ORDER",
+        friendly: "❌ Order was modified by another staff member. Refresh and try again.",
+      });
     }
     await tx.orderEvent.create({
       data: {
@@ -996,7 +1091,7 @@ export async function setOrderPrice(orderId: number, newPrice: number, ctx: Form
 export async function applyStatus(orderId: number, to: OrderStatus, ctx: FormCtx): Promise<void> {
   const order = await fetchOrder(orderId);
   if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ Order not found." });
-  if (!isStaffActor(ctx)) throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can change order status." });
+  assertStaffCanManage(order, ctx);
   if (!canTransition(order.status, to)) {
     throw new AppError({
       code: "BAD_TRANSITION",
@@ -1005,14 +1100,15 @@ export async function applyStatus(orderId: number, to: OrderStatus, ctx: FormCtx
   }
 
   await prisma.$transaction(async (tx) => {
-    // Conditional update: a duplicate "Mark Paid" (or any concurrent status
-    // change) sees count 0 and fails instead of double-transitioning.
+    // Optimistic lock: expected-status + updatedAt — a duplicate button press
+    // or a concurrent status change sees count 0 and fails instead of
+    // double-transitioning.
     const updated = await tx.order.updateMany({
-      where: { id: order.id, status: order.status },
+      where: { id: order.id, status: order.status, updatedAt: order.updatedAt },
       data: { status: to, ...(to === "COMPLETED" ? { completedAt: new Date() } : {}) },
     });
     if (updated.count === 0) {
-      throw new AppError({ code: "BAD_TRANSITION", friendly: "❌ This order was just updated by another staff member." });
+      throw new AppError({ code: "STALE_ORDER", friendly: "❌ Order was modified by another staff member. Refresh and try again." });
     }
     await tx.orderEvent.create({
       data: { orderId: order.id, type: to, fromStatus: order.status, toStatus: to, actorDiscordId: ctx.actorId },
