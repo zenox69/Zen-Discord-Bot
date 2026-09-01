@@ -24,10 +24,10 @@ import { CUSTOM_ID_PREFIX, LIMITS, cid } from "../config/constants.js";
 import { prisma } from "../database/prisma.js";
 import { audit } from "./AuditService.js";
 import { findSettings } from "./GuildSettingsService.js";
-import { getCommunityEligibility, type EligibilityEntry } from "./EligibilityService.js";
+import { getCommunityEligibility, eligibilityStatusLabel, type EligibilityEntry } from "./EligibilityService.js";
 import { isSendableChannel, type SendableChannel } from "../utils/channel.js";
 import { baseEmbed, COLORS, type EmbedColor } from "../utils/embeds.js";
-import { AppError } from "../utils/errors.js";
+import { AppError, isRobloxApiError } from "../utils/errors.js";
 import { formatMoney, tDate, tDateTime } from "../utils/discordTime.js";
 import { getBotClient } from "../utils/botClient.js";
 import { isStaff } from "../utils/permissions.js";
@@ -673,7 +673,71 @@ export async function handleBack(orderId: number, step: string, ctx: FormCtx, me
 // Submit
 // ---------------------------------------------------------------------------
 
-export async function submitOrder(orderId: number, ctx: FormCtx): Promise<void> {
+export type SubmitResult =
+  | { ok: true }
+  | { ok: false; reason: "ELIGIBILITY_CHANGED"; communityName: string; detail: string };
+
+/**
+ * Final eligibility revalidation: the snapshot taken at community-select can
+ * be minutes (or hours) old, and membership can change in between. The stored
+ * snapshot stays useful for audit/history but is NOT the final authority —
+ * we re-sync live memberships (forceRefresh) before DRAFT → SUBMITTED.
+ *
+ * Outcomes:
+ *  - still eligible  → fresh snapshot written, order submitted
+ *  - no longer eligible → order stays DRAFT, caller renders the retry UI
+ *  - RoProxy unavailable → AppError (NOT treated as ineligible), draft kept
+ */
+async function revalidateEligibility(order: OrderWithRelations, ctx: FormCtx): Promise<SubmitResult | null> {
+  if (!order.product.requiresEligibility) return null;
+
+  if (!order.product.enabled) {
+    throw new AppError({ code: "PRODUCT_GONE", friendly: "❌ This product is no longer available. Choose another one." });
+  }
+  if (!order.community || !order.community.enabled) {
+    throw new AppError({ code: "COMMUNITY_GONE", friendly: "❌ The selected community is no longer available. Choose another community." });
+  }
+  if (!order.robloxUserId) {
+    throw new AppError({ code: "NOT_VERIFIED", friendly: "❌ You must verify your Roblox account before ordering." });
+  }
+
+  let entry: EligibilityEntry | null;
+  try {
+    entry = await getCommunityEligibility(ctx.guildId, order.robloxUserId, order.community.id, { forceRefresh: true });
+  } catch (err) {
+    if (isRobloxApiError(err)) {
+      throw new AppError({
+        code: "ROBLOX_UNAVAILABLE",
+        friendly: "❌ Roblox services are unavailable right now, so we could not confirm your eligibility.\nYour order is still a draft — please try again in a few minutes.",
+      });
+    }
+    throw err;
+  }
+
+  const freshSnapshot = entry
+    ? {
+        status: entry.status,
+        eligibleAt: entry.eligibleAt?.toISOString() ?? null,
+        checkedAt: new Date().toISOString(),
+      }
+    : null;
+
+  if (entry?.status === "ELIGIBLE") {
+    return null; // eligible — caller proceeds; snapshot written inside the tx
+  }
+
+  // No longer eligible: keep the draft, but record the current truth.
+  if (freshSnapshot) {
+    await prisma.order.update({ where: { id: order.id }, data: { eligibilitySnapshot: freshSnapshot } });
+  }
+  let detail = entry ? eligibilityStatusLabel(entry.status) : "Community membership not found";
+  if (entry?.status === "NOT_ELIGIBLE" && entry.daysRemaining !== null) {
+    detail = `${detail} — ${entry.daysRemaining} days remaining`;
+  }
+  return { ok: false, reason: "ELIGIBILITY_CHANGED", communityName: order.community.name, detail };
+}
+
+export async function submitOrder(orderId: number, ctx: FormCtx): Promise<SubmitResult> {
   const rl = rateLimiter.consume(`order:submit:${ctx.actorId}`, LIMITS.orderSubmit.limit, LIMITS.orderSubmit.windowMs);
   if (!rl.ok) throw new AppError({ code: "RATE_LIMITED", friendly: retryPhrase(rl.retryAfterMs) });
 
@@ -682,15 +746,31 @@ export async function submitOrder(orderId: number, ctx: FormCtx): Promise<void> 
   if (order.status !== "DRAFT") throw new AppError({ code: "NOT_DRAFT", friendly: "❌ This order has already been submitted." });
   assertFormAccess(order, ctx);
 
+  const revalidation = await revalidateEligibility(order, ctx);
+  if (revalidation) return revalidation;
+
   const submitted = await prisma.$transaction(async (tx) => {
     const incremented = await tx.guildSettings.update({
       where: { guildId: order.guildId },
       data: { orderCounter: { increment: 1 } },
     });
-    const final = await tx.order.update({
-      where: { id: order.id },
-      data: { status: "SUBMITTED", number: zeroPad(incremented.orderCounter), submittedAt: new Date() },
+    // Conditional update: a duplicate/concurrent submit sees count 0 and the
+    // whole transaction (including the counter bump) rolls back.
+    const updated = await tx.order.updateMany({
+      where: { id: order.id, status: "DRAFT" },
+      data: {
+        status: "SUBMITTED",
+        number: zeroPad(incremented.orderCounter),
+        submittedAt: new Date(),
+        ...(order.product.requiresEligibility
+          ? { eligibilitySnapshot: { status: "ELIGIBLE", checkedAt: new Date().toISOString() } }
+          : {}),
+      },
     });
+    if (updated.count === 0) {
+      throw new AppError({ code: "NOT_DRAFT", friendly: "❌ This order has already been submitted." });
+    }
+    const final = await tx.order.findUniqueOrThrow({ where: { id: order.id } });
     await tx.orderEvent.create({
       data: {
         orderId: order.id,
@@ -741,6 +821,8 @@ export async function submitOrder(orderId: number, ctx: FormCtx): Promise<void> 
       data: { messageId: orderMessageId },
     },
   }).catch(() => undefined);
+
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -768,10 +850,14 @@ export async function cancelOrder(orderIdOrTicketRef: string, ctx: FormCtx, reas
   }
 
   const updated = await prisma.$transaction(async (tx) => {
-    const u = await tx.order.update({
-      where: { id: order.id },
+    // Conditional update: a duplicate/concurrent cancel sees count 0.
+    const u = await tx.order.updateMany({
+      where: { id: order.id, status: order.status },
       data: { status: "CANCELLED", cancelledAt: new Date(), cancelReason: reason ?? null },
     });
+    if (u.count === 0) {
+      throw new AppError({ code: "BAD_TRANSITION", friendly: "❌ This order was just updated by someone else." });
+    }
     await tx.orderEvent.create({
       data: {
         orderId: order.id,
@@ -782,7 +868,7 @@ export async function cancelOrder(orderIdOrTicketRef: string, ctx: FormCtx, reas
         data: { reason: reason ?? null },
       },
     });
-    return u;
+    return tx.order.findUniqueOrThrow({ where: { id: order.id } });
   });
 
   await audit({
@@ -805,29 +891,35 @@ export async function claimOrder(orderId: number, ctx: FormCtx): Promise<void> {
   const order = await fetchOrder(orderId);
   if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ Order not found." });
   if (!isStaffActor(ctx)) throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can claim orders." });
-  if (order.assignedStaffId && order.assignedStaffId !== ctx.actorId) {
-    if (!isActorAdmin(ctx)) {
-      throw new AppError({ code: "ALREADY_CLAIMED", friendly: `❌ Already claimed by <@${order.assignedStaffId}>.` });
-    }
-  }
-  if (order.status !== "STAFF_REVIEW" && order.status !== "QUOTED") {
+  if (order.status !== "SUBMITTED" && order.status !== "STAFF_REVIEW" && order.status !== "QUOTED") {
     throw new AppError({ code: "BAD_TRANSITION", friendly: `❌ Orders in **${STATUS_LABEL[order.status]}** cannot be claimed.` });
+  }
+  if (order.assignedStaffId === ctx.actorId) {
+    throw new AppError({ code: "ALREADY_CLAIMED", friendly: "❌ You are already assigned to this order." });
+  }
+  // Reassignment of an order claimed by someone else is admin-only.
+  if (order.assignedStaffId && order.assignedStaffId !== ctx.actorId && !isActorAdmin(ctx)) {
+    throw new AppError({ code: "ALREADY_CLAIMED", friendly: `❌ Already claimed by <@${order.assignedStaffId}>.` });
   }
 
   await prisma.$transaction(async (tx) => {
+    // Conditional update: two simultaneous claims — only one wins.
+    const updated = await tx.order.updateMany({
+      where: { id: order.id, status: order.status, assignedStaffId: order.assignedStaffId },
+      data: {
+        assignedStaffId: ctx.actorId,
+        ...(order.status === "SUBMITTED" ? { status: "STAFF_REVIEW" as const } : {}),
+      },
+    });
+    if (updated.count === 0) {
+      throw new AppError({ code: "ALREADY_CLAIMED", friendly: "❌ This order was just claimed or updated by another staff member." });
+    }
     if (order.assignedStaffId) {
       await tx.staffAssignment.updateMany({
         where: { orderId: order.id, staffDiscordId: order.assignedStaffId, unassignedAt: null },
         data: { unassignedAt: new Date() },
       });
     }
-    await tx.order.update({
-      where: { id: order.id },
-      data: {
-        assignedStaffId: ctx.actorId,
-        ...(order.status === "SUBMITTED" ? { status: "STAFF_REVIEW" as const } : {}),
-      },
-    });
     await tx.staffAssignment.create({ data: { orderId: order.id, staffDiscordId: ctx.actorId } });
     await tx.orderEvent.create({
       data: {
@@ -859,18 +951,24 @@ export async function setOrderPrice(orderId: number, newPrice: number, ctx: Form
   const order = await fetchOrder(orderId);
   if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ Order not found." });
   if (!isStaffActor(ctx)) throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can set prices." });
-  if (order.status !== "SUBMITTED" && order.status !== "STAFF_REVIEW") {
+  // Intended flow: SUBMITTED → Claim → STAFF_REVIEW → Set Price → QUOTED.
+  // QUOTED → QUOTED is a price adjustment (recorded in order events + audit).
+  if (order.status !== "STAFF_REVIEW" && order.status !== "QUOTED") {
     throw new AppError({
       code: "BAD_TRANSITION",
-      friendly: `❌ Claim the order first. Price can be set during **${STATUS_LABEL.STAFF_REVIEW}** or **${STATUS_LABEL.QUOTED}**.`,
+      friendly: `❌ Claim the order first. Price can be set during **${STATUS_LABEL.STAFF_REVIEW}** or adjusted during **${STATUS_LABEL.QUOTED}**.`,
     });
   }
 
   await prisma.$transaction(async (tx) => {
-    await tx.order.update({
-      where: { id: order.id },
+    // Conditional update: a duplicate/concurrent price set sees count 0.
+    const updated = await tx.order.updateMany({
+      where: { id: order.id, status: order.status },
       data: { price: newPrice, status: "QUOTED" },
     });
+    if (updated.count === 0) {
+      throw new AppError({ code: "BAD_TRANSITION", friendly: "❌ This order was just updated by another staff member." });
+    }
     await tx.orderEvent.create({
       data: {
         orderId: order.id,
@@ -907,10 +1005,15 @@ export async function applyStatus(orderId: number, to: OrderStatus, ctx: FormCtx
   }
 
   await prisma.$transaction(async (tx) => {
-    await tx.order.update({
-      where: { id: order.id },
+    // Conditional update: a duplicate "Mark Paid" (or any concurrent status
+    // change) sees count 0 and fails instead of double-transitioning.
+    const updated = await tx.order.updateMany({
+      where: { id: order.id, status: order.status },
       data: { status: to, ...(to === "COMPLETED" ? { completedAt: new Date() } : {}) },
     });
+    if (updated.count === 0) {
+      throw new AppError({ code: "BAD_TRANSITION", friendly: "❌ This order was just updated by another staff member." });
+    }
     await tx.orderEvent.create({
       data: { orderId: order.id, type: to, fromStatus: order.status, toStatus: to, actorDiscordId: ctx.actorId },
     });

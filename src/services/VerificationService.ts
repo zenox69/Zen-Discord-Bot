@@ -179,8 +179,10 @@ async function check(ctx: InteractionContext): Promise<void> {
   }
 
   // Infrastructure failure must NEVER look like a failed challenge.
+  // forceRefresh: the user may have edited their description AFTER a profile
+  // was cached by an earlier lookup — verification must see the live text.
   await deferEphemeral(interaction);
-  const profile = await roblox.getProfile(pending.robloxUserId);
+  const profile = await roblox.getProfile(pending.robloxUserId, { forceRefresh: true });
   if (profile === null) {
     await prisma.robloxVerification.delete({ where: { id: pending.id } });
     throw new AppError({

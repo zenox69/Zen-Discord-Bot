@@ -225,10 +225,17 @@ async function getProfileOnce(userId: string): Promise<RobloxProfile | null> {
   };
 }
 
-/** Public profile, or null when the account does not exist. Throws on infra failure. */
-async function getProfile(userId: string): Promise<RobloxProfile | null> {
-  const cached = profileCache.get(userId);
-  if (cached !== undefined) return cached;
+/**
+ * Public profile, or null when the account does not exist. Throws on infra failure.
+ * Pass { forceRefresh: true } to bypass the TTL cache read (the fresh result is
+ * still written back to the cache). Verification checks MUST use this — a user
+ * who just edited their profile description must not be judged on stale data.
+ */
+async function getProfile(userId: string, opts?: { forceRefresh?: boolean }): Promise<RobloxProfile | null> {
+  if (!opts?.forceRefresh) {
+    const cached = profileCache.get(userId);
+    if (cached !== undefined) return cached;
+  }
 
   let result: RobloxProfile | null;
   try {
@@ -328,10 +335,14 @@ async function getGroupRolesOnce(userId: string): Promise<GroupRole[]> {
  * CURRENT group memberships for a Roblox user.
  * IMPORTANT: on RoProxy failure this throws RobloxApiError — callers must
  * surface "services unavailable" and must never report "not a member".
+ * { forceRefresh: true } bypasses the TTL cache read (final order-submission
+ * revalidation must not trust a stale membership snapshot).
  */
-async function getGroupRoles(userId: string): Promise<GroupRole[]> {
-  const cached = groupsCache.get(userId);
-  if (cached !== undefined) return cached;
+async function getGroupRoles(userId: string, opts?: { forceRefresh?: boolean }): Promise<GroupRole[]> {
+  if (!opts?.forceRefresh) {
+    const cached = groupsCache.get(userId);
+    if (cached !== undefined) return cached;
+  }
   const roles = await getGroupRolesOnce(userId);
   groupsCache.set(userId, roles, ROBLOX_CACHE_TTL_MS.groups);
   return roles;

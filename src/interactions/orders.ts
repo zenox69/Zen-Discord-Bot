@@ -153,7 +153,31 @@ export async function handleSubmitOrder(ctx: InteractionContext): Promise<void> 
   const interaction = ctx.interaction;
   if (!interaction.isButton()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
   const { ctx: formCtx, message } = await getFormContext(interaction);
-  await submitOrder(Number(ctx.parts[0]), formCtx);
+  const orderId = Number(ctx.parts[0]);
+  const result = await submitOrder(orderId, formCtx);
+  if (!result.ok) {
+    // Final revalidation failed — the draft is kept; offer recovery actions.
+    await message.edit({
+      content: [
+        "📝 **ORDER FORM**",
+        "",
+        "❌ **ELIGIBILITY CHANGED**",
+        "You are no longer currently eligible for this community.",
+        "Your order has **not** been submitted.",
+        "",
+        `Community: **${result.communityName}**`,
+        `Current status: **${result.detail}**`,
+      ].join("\n"),
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(cid(CUSTOM_ID_PREFIX.order, "back", orderId, "2")).setLabel("Choose Another Community").setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId(cid(CUSTOM_ID_PREFIX.order, "cancel", orderId)).setLabel("Cancel Order").setStyle(ButtonStyle.Danger),
+        ),
+      ],
+      embeds: [],
+    });
+    return;
+  }
   await message.edit({
     content: "✅ **Order submitted!** A staff member will review it shortly. Track progress on the order card.",
     components: [],

@@ -4,6 +4,17 @@ import { audit } from "../services/AuditService.js";
 import { syncMemberships } from "../services/EligibilityService.js";
 import { log } from "../utils/logger.js";
 
+/**
+ * Periodic membership refresh.
+ *
+ * Scaling note (reviewed deliberately): this loop is sequential ON PURPOSE.
+ * RobloxService already serializes every RoProxy call through a centralized
+ * 250ms request gap, so a bounded worker pool here could NOT increase
+ * upstream throughput — it would only overlap database work, which is cheap.
+ * A pool would add race-condition surface for no real gain at this scale.
+ * Keep it sequential; if volume ever grows, raise the rate limiter's scope
+ * (with upstream awareness) before parallelizing this job.
+ */
 export async function refreshTrackedMemberships(): Promise<void> {
   const tracked = await prisma.communityMembership.findMany({
     where: { community: { enabled: true } },

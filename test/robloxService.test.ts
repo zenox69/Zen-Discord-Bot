@@ -180,3 +180,48 @@ describe("retry behaviour", () => {
     expect(callCount).toBe(1);
   });
 });
+
+describe("cache freshness", () => {
+  it("serves cached profiles but forceRefresh sees the new description and warms the cache", async () => {
+    mockFetch();
+    let description = "old text";
+    responder = () =>
+      jsonResponse(200, {
+        id: 808,
+        name: "cache_user",
+        created: "2010-01-01T00:00:00.000Z",
+        description,
+      });
+    const first = await roblox.getProfile("808");
+    expect(first?.description).toBe("old text");
+    const cached = await roblox.getProfile("808");
+    expect(cached?.description).toBe("old text");
+    expect(callCount).toBe(1); // second lookup served from cache
+
+    description = "BW-7K4P9X";
+    const fresh = await roblox.getProfile("808", { forceRefresh: true });
+    expect(fresh?.description).toBe("BW-7K4P9X");
+    expect(callCount).toBe(2);
+
+    const after = await roblox.getProfile("808");
+    expect(after?.description).toBe("BW-7K4P9X"); // fresh result warmed the cache
+    expect(callCount).toBe(2);
+  });
+
+  it("forceRefresh bypasses the group-membership cache", async () => {
+    mockFetch();
+    let groupId = 11;
+    responder = () =>
+      jsonResponse(200, {
+        data: [{ group: { id: groupId, name: "Community A" }, role: { id: 1, name: "Member", rank: 1 } }],
+      });
+    await roblox.getGroupRoles("818");
+    await roblox.getGroupRoles("818");
+    expect(callCount).toBe(1);
+
+    groupId = 22;
+    const roles = await roblox.getGroupRoles("818", { forceRefresh: true });
+    expect(roles[0]?.groupId).toBe("22");
+    expect(callCount).toBe(2);
+  });
+});

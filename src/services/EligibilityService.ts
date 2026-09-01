@@ -88,11 +88,16 @@ const STATUS_ORDER: Record<EligibilityStatus, number> = {
  *
  * Throws RobloxApiError on RoProxy failure — callers must surface that as
  * "services unavailable", never as "not a member".
+ * { forceRefresh: true } bypasses the membership cache (final order submit).
  */
-export async function syncMemberships(robloxUserId: string, guildId: string): Promise<void> {
+export async function syncMemberships(
+  robloxUserId: string,
+  guildId: string,
+  opts?: { forceRefresh?: boolean },
+): Promise<void> {
   const [communities, roles] = await Promise.all([
     prisma.robloxCommunity.findMany({ where: { guildId } }),
-    roblox.getGroupRoles(robloxUserId),
+    roblox.getGroupRoles(robloxUserId, opts),
   ]);
   if (communities.length === 0) return;
 
@@ -281,9 +286,14 @@ function computeEntry(
 /**
  * Live eligibility report: syncs memberships first (throws RobloxApiError on
  * RoProxy failure), then computes every community's status.
+ * { forceRefresh: true } forces a live RoProxy membership sync.
  */
-export async function getEligibility(robloxUserId: string, guildId: string): Promise<EligibilityReport> {
-  await syncMemberships(robloxUserId, guildId);
+export async function getEligibility(
+  robloxUserId: string,
+  guildId: string,
+  opts?: { forceRefresh?: boolean },
+): Promise<EligibilityReport> {
+  await syncMemberships(robloxUserId, guildId, opts);
 
   const [communities, memberships] = await Promise.all([
     prisma.robloxCommunity.findMany({ where: { guildId, enabled: true } }),
@@ -573,7 +583,13 @@ export async function getCommunityEligibility(
   guildId: string,
   robloxUserId: string,
   communityId: number,
+  opts?: { forceRefresh?: boolean },
 ): Promise<EligibilityEntry | null> {
-  const report = await getEligibility(robloxUserId, guildId);
+  const report = await getEligibility(robloxUserId, guildId, opts);
   return report.entries.find((e) => e.community.id === communityId) ?? null;
+}
+
+/** Human label for an eligibility status (used by the order flow). */
+export function eligibilityStatusLabel(status: EligibilityStatus): string {
+  return STATUS_LABEL[status];
 }
