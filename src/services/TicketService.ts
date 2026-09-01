@@ -18,7 +18,7 @@ import { isSendableChannel } from "../utils/channel.js";
 import { baseEmbed, COLORS } from "../utils/embeds.js";
 import { AppError } from "../utils/errors.js";
 import { log } from "../utils/logger.js";
-import { isStaff } from "../utils/permissions.js";
+import { isAdmin, isStaff } from "../utils/permissions.js";
 import { slugify, zeroPad } from "../utils/text.js";
 import { audit } from "./AuditService.js";
 
@@ -109,26 +109,29 @@ export async function publishTicketPanel(guildId: string, kind: PanelKind, targe
 }
 
 export async function canCloseTicket(guildId: string, member: GuildMember, ticket: Ticket & { order?: Order | null }): Promise<boolean> {
-  if (member.id === ticket.discordUserId) {
-    // The ticket owner may close freely — unless an ACTIVE order lives in
-    // this ticket: closing would orphan it (channel deleted, order stuck
-    // without its staff-control card). They must cancel the order first.
-    const order = ticket.order ?? (await prisma.order.findFirst({ where: { ticketId: ticket.id } }));
-    if (order && ACTIVE_ORDER_STATUSES.has(order.status)) return false;
-    return true;
+  const order = ticket.order ?? (await prisma.order.findFirst({ where: { ticketId: ticket.id } }));
+  const activeOrder = !!order && ACTIVE_ORDER_STATUSES.has(order.status);
+
+  if (activeOrder) {
+    // Active-order ticket closure is an administrator-only force action.
+    // Customer and normal staff closure would orphan the live workflow.
+    const settings = await findSettings(guildId);
+    if (settings) return isAdmin(member, settings);
+    return member.guild.ownerId === member.id || member.permissions.has(PermissionFlagsBits.Administrator);
   }
+
+  if (member.id === ticket.discordUserId) return true;
   const settings = await findSettings(guildId);
   return settings ? isStaff(member, settings) : false;
 }
 
 /**
- * Why the ticket owner cannot close right now (null = no blocker).
- * Staff closures are never blocked by an active order — they may cancel it.
+ * Why a non-admin cannot close right now (null = no blocker).
  */
-export async function getOwnerCloseBlocker(ticket: Ticket & { order?: Order | null }): Promise<string | null> {
+export async function getActiveOrderCloseBlocker(ticket: Ticket & { order?: Order | null }): Promise<string | null> {
   const order = ticket.order ?? (await prisma.order.findFirst({ where: { ticketId: ticket.id } }));
   if (order && ACTIVE_ORDER_STATUSES.has(order.status)) {
-    return "❌ This ticket still has an **active order** in progress. Cancel the order first (or ask staff to close it after completion), then close the ticket.";
+    return "❌ This ticket still has an **active order** in progress. Cancel or complete the order first. Only an administrator can intentionally force-close an active-order ticket.";
   }
   return null;
 }
@@ -297,6 +300,14 @@ export async function closeTicket(params: {
 
   const client = getBotClient();
   const guild = await client.guilds.fetch(guildId);
+  const actor = await guild.members.fetch(actorDiscordId).catch(() => null);
+  if (!actor || !(await canCloseTicket(guildId, actor, ticket))) {
+    const blocker = await getActiveOrderCloseBlocker(ticket);
+    throw new AppError({
+      code: blocker ? "ORDER_ACTIVE" : "NOT_ALLOWED",
+      friendly: blocker ?? "❌ You are not allowed to close this ticket.",
+    });
+  }
   const channel = ticket.channelId ? (await guild.channels.fetch(ticket.channelId).catch(() => null)) : null;
 
   await prisma.$transaction([

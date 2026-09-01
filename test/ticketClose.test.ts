@@ -5,18 +5,36 @@ import type { Order, Ticket } from "@prisma/client";
 const mocks = vi.hoisted(() => ({
   prisma: {
     order: { findFirst: vi.fn() },
+    ticket: { findUnique: vi.fn() },
+    $transaction: vi.fn(),
   },
   findSettings: vi.fn(async () => null),
+  fetchMember: vi.fn(),
 }));
 
 vi.mock("../src/database/prisma.js", () => ({ prisma: mocks.prisma }));
 vi.mock("../src/services/GuildSettingsService.js", () => ({ findSettings: mocks.findSettings }));
+vi.mock("../src/utils/botClient.js", () => ({
+  getBotClient: () => ({
+    guilds: {
+      fetch: async () => ({
+        members: { fetch: mocks.fetchMember },
+        channels: { fetch: vi.fn(async () => null) },
+      }),
+    },
+  }),
+}));
 
-import { canCloseTicket, getOwnerCloseBlocker } from "../src/services/TicketService.js";
+import { canCloseTicket, closeTicket, getActiveOrderCloseBlocker } from "../src/services/TicketService.js";
 import { ACTIVE_ORDER_STATUSES } from "../src/services/orderTransitions.js";
 
-function makeMember(id: string): DjsGuildMember {
-  return { id } as unknown as DjsGuildMember;
+function makeMember(id: string, roleIds: string[] = [], administrator = false): DjsGuildMember {
+  return {
+    id,
+    guild: { ownerId: "owner-1" },
+    roles: { cache: Object.assign(roleIds.map((roleId) => ({ id: roleId })), { has: (roleId: string) => roleIds.includes(roleId) }) },
+    permissions: { has: () => administrator },
+  } as unknown as DjsGuildMember;
 }
 
 function makeTicket(): Ticket {
@@ -73,31 +91,43 @@ describe("canCloseTicket — active order protection", () => {
     expect(mocks.prisma.order.findFirst).not.toHaveBeenCalled();
   });
 
-  it("staff can always close (they cancel the order first if needed)", async () => {
-    mocks.findSettings.mockResolvedValue({ staffRoleId: "staff-role" } as never);
-    const member = {
-      id: "staff-1",
-      guild: { ownerId: "owner-1" },
-      roles: { cache: Object.assign([{ id: "staff-role" }], { has: (id: string) => id === "staff-role" }) },
-      permissions: { has: () => false },
-    } as unknown as DjsGuildMember;
+  it("blocks normal staff on active orders but allows an administrator override", async () => {
+    mocks.findSettings.mockResolvedValue({ staffRoleId: "staff-role", adminRoleId: "admin-role" } as never);
     const ticket = makeTicket();
     mocks.prisma.order.findFirst.mockResolvedValue(makeOrder("PAID"));
-    expect(await canCloseTicket("g-1", member, ticket)).toBe(true);
+    expect(await canCloseTicket("g-1", makeMember("staff-1", ["staff-role"]), ticket)).toBe(false);
+    expect(await canCloseTicket("g-1", makeMember("admin-1", ["admin-role"]), ticket)).toBe(true);
+    expect(await canCloseTicket("g-1", makeMember("native-admin", [], true), ticket)).toBe(true);
   });
 });
 
-describe("getOwnerCloseBlocker", () => {
+describe("getActiveOrderCloseBlocker", () => {
   it("explains the active-order blocker", async () => {
     mocks.prisma.order.findFirst.mockResolvedValue(makeOrder("IN_PROGRESS"));
-    const blocker = await getOwnerCloseBlocker(makeTicket());
+    const blocker = await getActiveOrderCloseBlocker(makeTicket());
     expect(blocker).toContain("active order");
+    expect(blocker).toContain("administrator");
   });
 
   it("returns null when there is no blocker", async () => {
     mocks.prisma.order.findFirst.mockResolvedValue(makeOrder("CANCELLED"));
-    expect(await getOwnerCloseBlocker(makeTicket())).toBeNull();
+    expect(await getActiveOrderCloseBlocker(makeTicket())).toBeNull();
     mocks.prisma.order.findFirst.mockResolvedValue(null);
-    expect(await getOwnerCloseBlocker(makeTicket())).toBeNull();
+    expect(await getActiveOrderCloseBlocker(makeTicket())).toBeNull();
+  });
+});
+
+describe("closeTicket — authoritative active-order guard", () => {
+  it("blocks normal staff before the close transaction runs", async () => {
+    const ticket = makeTicket() as Ticket & { order: Order };
+    ticket.order = makeOrder("IN_PROGRESS");
+    mocks.prisma.ticket.findUnique.mockResolvedValue(ticket);
+    mocks.findSettings.mockResolvedValue({ staffRoleId: "staff-role", adminRoleId: "admin-role" } as never);
+    mocks.fetchMember.mockResolvedValue(makeMember("staff-1", ["staff-role"]));
+
+    await expect(closeTicket({ guildId: "g-1", ticketId: 5, actorDiscordId: "staff-1" })).rejects.toMatchObject({
+      code: "ORDER_ACTIVE",
+    });
+    expect(mocks.prisma.$transaction).not.toHaveBeenCalled();
   });
 });

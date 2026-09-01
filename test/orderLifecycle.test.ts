@@ -605,13 +605,13 @@ describe("buildOrderStaffControls", () => {
   }
 
   it("shows only valid actions per status", () => {
-    expect(labelsFor("SUBMITTED", null)).toEqual(["Claim", "Cancel", "Close"]);
-    expect(labelsFor("STAFF_REVIEW")).toEqual(["Set Price", "Cancel", "Close"]);
-    expect(labelsFor("QUOTED")).toEqual(["Edit Price", "Await Payment", "Cancel", "Close"]);
-    expect(labelsFor("AWAITING_PAYMENT")).toEqual(["Edit Price", "Mark Paid", "Cancel", "Close"]);
-    expect(labelsFor("PAID")).toEqual(["Start", "Cancel", "Close"]);
-    expect(labelsFor("IN_PROGRESS")).toEqual(["Ready", "Cancel", "Close"]);
-    expect(labelsFor("READY")).toEqual(["Complete", "Cancel", "Close"]);
+    expect(labelsFor("SUBMITTED", null)).toEqual(["Claim", "Cancel", "Admin Close"]);
+    expect(labelsFor("STAFF_REVIEW")).toEqual(["Set Price", "Cancel", "Admin Close"]);
+    expect(labelsFor("QUOTED")).toEqual(["Edit Price", "Await Payment", "Cancel", "Admin Close"]);
+    expect(labelsFor("AWAITING_PAYMENT")).toEqual(["Edit Price", "Mark Paid", "Cancel", "Admin Close"]);
+    expect(labelsFor("PAID")).toEqual(["Start", "Cancel", "Admin Close"]);
+    expect(labelsFor("IN_PROGRESS")).toEqual(["Ready", "Cancel", "Admin Close"]);
+    expect(labelsFor("READY")).toEqual(["Complete", "Cancel", "Admin Close"]);
     expect(labelsFor("COMPLETED")).toEqual(["Close"]);
     expect(labelsFor("CANCELLED")).toEqual(["Close"]);
     expect(labelsFor("REFUNDED")).toEqual(["Close"]);

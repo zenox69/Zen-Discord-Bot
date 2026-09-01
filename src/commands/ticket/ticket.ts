@@ -1,7 +1,7 @@
 import { SlashCommandBuilder } from "@discordjs/builders";
 import { GuildMember } from "discord.js";
 import { prisma } from "../../database/prisma.js";
-import { closeTicket, canCloseTicket, getOwnerCloseBlocker, publishTicketPanel } from "../../services/TicketService.js";
+import { closeTicket, canCloseTicket, getActiveOrderCloseBlocker, publishTicketPanel } from "../../services/TicketService.js";
 import { baseEmbed, COLORS } from "../../utils/embeds.js";
 import { AppError } from "../../utils/errors.js";
 import { findSettings } from "../../services/GuildSettingsService.js";
@@ -49,10 +49,8 @@ export const ticketCommand: MarketplaceCommand = {
     }
     const member = interaction.member as GuildMember;
     if (!(await canCloseTicket(guildId, member, ticket))) {
-      if (member.id === ticket.discordUserId) {
-        const blocker = await getOwnerCloseBlocker(ticket);
-        throw new AppError({ code: "ORDER_ACTIVE", friendly: blocker ?? "❌ You cannot close this ticket right now." });
-      }
+      const blocker = await getActiveOrderCloseBlocker(ticket);
+      if (blocker) throw new AppError({ code: "ORDER_ACTIVE", friendly: blocker });
       throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only the ticket owner or staff can close this ticket." });
     }
     await closeTicket({ guildId, ticketId: ticket.id, actorDiscordId: interaction.user.id, reason: "Closed via /ticket close" });

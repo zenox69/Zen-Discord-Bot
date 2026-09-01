@@ -80,7 +80,7 @@ export const STATUS_LABEL: Record<OrderStatus, string> = {
 };
 
 export { canTransition, TRANSITIONS } from "./orderTransitions.js";
-import { canTransition } from "./orderTransitions.js";
+import { ACTIVE_ORDER_STATUSES, canTransition } from "./orderTransitions.js";
 
 async function fetchOrder(orderId: number): Promise<OrderWithRelations | null> {
   return prisma.order.findUnique({
@@ -247,7 +247,7 @@ export function buildOrderStaffControls(order: OrderWithRelations): ActionRowBui
       order.ticket
         ? new ButtonBuilder()
             .setCustomId(cid(CUSTOM_ID_PREFIX.ticket, "close", order.ticket.id))
-            .setLabel("Close")
+            .setLabel(ACTIVE_ORDER_STATUSES.has(order.status) ? "Admin Close" : "Close")
             .setEmoji("🔒")
             .setStyle(ButtonStyle.Danger)
         : new ButtonBuilder().setCustomId(cid(CUSTOM_ID_PREFIX.order, "noop", "0")).setLabel("Close").setEmoji("🔒").setStyle(ButtonStyle.Danger).setDisabled(true),
