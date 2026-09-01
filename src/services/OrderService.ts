@@ -135,7 +135,10 @@ function assertStaffCanManage(order: OrderWithRelations, ctx: FormCtx): void {
  * Strict money input: digits with at most 2 decimals, plain and unsigned.
  * Accepts 500, 500.00, 0, 0.50, 1250.5 — rejects abc, 500abc, ₱500, "..",
  * 1.2.3, "-", empty, and anything Number() cannot represent finitely.
+ * Capped at the Decimal(10,2) column limit.
  */
+export const MAX_ORDER_PRICE = 99_999_999.99;
+
 export function parsePriceInput(raw: string): number {
   const text = raw.trim();
   if (!/^\d+(\.\d{1,2})?$/.test(text)) {
@@ -144,6 +147,9 @@ export function parsePriceInput(raw: string): number {
   const price = Number(text);
   if (!Number.isFinite(price) || price < 0) {
     throw new AppError({ code: "INVALID_PRICE", friendly: "❌ Invalid price. Enter a plain number like **500** or **500.50**." });
+  }
+  if (price > MAX_ORDER_PRICE) {
+    throw new AppError({ code: "INVALID_PRICE", friendly: `❌ Price is too large — the maximum is **${MAX_ORDER_PRICE.toLocaleString("en-US", { minimumFractionDigits: 2 })}**.` });
   }
   return price;
 }
@@ -1034,7 +1040,20 @@ export async function claimOrder(orderId: number, ctx: FormCtx): Promise<void> {
   if (withRelations) await refreshOrderMessage(withRelations);
 }
 
-export async function setOrderPrice(orderId: number, newPrice: number, ctx: FormCtx): Promise<void> {
+/**
+ * Set (or adjust) the order price.
+ *
+ * expectedUpdatedAt is the order's updatedAt AT THE MOMENT THE PRICE MODAL
+ * WAS OPENED (carried in the modal custom id). Locking on it — not on the
+ * freshly fetched row — means a modal submitted after another staff member
+ * already changed the order cannot silently overwrite their edit.
+ */
+export async function setOrderPrice(
+  orderId: number,
+  newPrice: number,
+  ctx: FormCtx,
+  expectedUpdatedAt: Date,
+): Promise<void> {
   if (!Number.isFinite(newPrice) || newPrice < 0) {
     throw new AppError({ code: "INVALID_PRICE", friendly: "❌ Price must be a number ≥ 0." });
   }
@@ -1042,21 +1061,25 @@ export async function setOrderPrice(orderId: number, newPrice: number, ctx: Form
   if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ Order not found." });
   assertStaffCanManage(order, ctx);
   // Intended flow: SUBMITTED → Claim → STAFF_REVIEW → Set Price → QUOTED.
-  // QUOTED → QUOTED is a price adjustment (recorded in order events + audit).
-  if (order.status !== "STAFF_REVIEW" && order.status !== "QUOTED") {
+  // QUOTED / AWAITING_PAYMENT → QUOTED / AWAITING_PAYMENT is a price
+  // adjustment (recorded in order events + audit); the status is preserved.
+  if (order.status !== "STAFF_REVIEW" && order.status !== "QUOTED" && order.status !== "AWAITING_PAYMENT") {
     throw new AppError({
       code: "BAD_TRANSITION",
-      friendly: `❌ Claim the order first. Price can be set during **${STATUS_LABEL.STAFF_REVIEW}** or adjusted during **${STATUS_LABEL.QUOTED}**.`,
+      friendly: `❌ Claim the order first. Price can be set during **${STATUS_LABEL.STAFF_REVIEW}** or adjusted during **${STATUS_LABEL.QUOTED}** / **${STATUS_LABEL.AWAITING_PAYMENT}**.`,
     });
   }
 
+  // STAFF_REVIEW advances to QUOTED when priced; later states keep theirs.
+  const targetStatus: OrderStatus = order.status === "STAFF_REVIEW" ? "QUOTED" : order.status;
+
   await prisma.$transaction(async (tx) => {
-    // Optimistic lock on updatedAt: a same-status (QUOTED -> QUOTED) price
-    // edit must not silently overwrite a change another staff member just
-    // made. count 0 = someone modified the order after we loaded it.
+    // Optimistic lock on the updatedAt captured when the modal opened: a
+    // stale modal or a concurrent edit sees count 0 instead of overwriting
+    // another staff member's change.
     const updated = await tx.order.updateMany({
-      where: { id: order.id, status: order.status, updatedAt: order.updatedAt },
-      data: { price: newPrice, status: "QUOTED" },
+      where: { id: order.id, status: order.status, updatedAt: expectedUpdatedAt },
+      data: { price: newPrice, status: targetStatus },
     });
     if (updated.count === 0) {
       throw new AppError({
@@ -1069,7 +1092,7 @@ export async function setOrderPrice(orderId: number, newPrice: number, ctx: Form
         orderId: order.id,
         type: "PRICE_SET",
         fromStatus: order.status,
-        toStatus: "QUOTED",
+        toStatus: targetStatus,
         actorDiscordId: ctx.actorId,
         data: { oldPrice: order.price.toString(), newPrice: String(newPrice) },
       },

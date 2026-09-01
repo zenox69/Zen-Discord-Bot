@@ -212,9 +212,15 @@ export async function handleClaim(ctx: InteractionContext): Promise<void> {
 export async function openSetPriceModal(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;
   if (!interaction.isButton()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
+  const orderId = Number(requiredPart(ctx, 0));
+  // Capture the order's updatedAt NOW: the modal carries it as a concurrency
+  // token, so a stale modal submitted after another staff member's edit is
+  // rejected instead of overwriting their change.
+  const order = await prisma.order.findUnique({ where: { id: orderId }, select: { updatedAt: true } });
+  if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ Order not found.", expected: false });
   await interaction.showModal(
     new ModalBuilder()
-      .setCustomId(cid(CUSTOM_ID_PREFIX.order, "set-price", requiredPart(ctx, 0)))
+      .setCustomId(cid(CUSTOM_ID_PREFIX.order, "set-price", String(orderId), String(order.updatedAt.getTime())))
       .setTitle("Set Order Price")
       .addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
@@ -234,9 +240,15 @@ export async function submitSetPriceModal(ctx: InteractionContext): Promise<void
   if (!interaction.isModalSubmit()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
   const formCtx = await getStaffContext(interaction);
   const orderId = Number(ctx.parts[0]);
+  const tokenMs = Number(ctx.parts[1]);
+  if (!Number.isInteger(tokenMs) || tokenMs <= 0) {
+    // A modal without (or with an invalid) concurrency token predates this
+    // protection — force a fresh open so the token is captured.
+    throw new AppError({ code: "STALE_MODAL", friendly: "❌ This price dialog is outdated. Reopen it from the order card." });
+  }
   const raw = interaction.fields.getTextInputValue("price") ?? "";
   const price = parsePriceInput(raw);
-  await setOrderPrice(orderId, price, formCtx);
+  await setOrderPrice(orderId, price, formCtx, new Date(tokenMs));
   await interaction.reply({ content: `✅ Price set to **${price}**.`, ephemeral: true });
 }
 

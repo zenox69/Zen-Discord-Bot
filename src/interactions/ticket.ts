@@ -9,7 +9,7 @@ import {
 } from "discord.js";
 import { CUSTOM_ID_PREFIX, LIMITS, cid } from "../config/constants.js";
 import { prisma } from "../database/prisma.js";
-import { closeTicket, createTicket, canCloseTicket } from "../services/TicketService.js";
+import { closeTicket, createTicket, canCloseTicket, getOwnerCloseBlocker } from "../services/TicketService.js";
 import { startOrderForm } from "../services/OrderService.js";
 import { getBotClient } from "../utils/botClient.js";
 import { isSendableChannel } from "../utils/channel.js";
@@ -34,6 +34,24 @@ async function requireMember(ctx: InteractionContext): Promise<GuildMember> {
     throw new AppError({ code: "NOT_A_MEMBER", friendly: "❌ This can only be used by server members." });
   }
   return member;
+}
+
+/**
+ * Owner gate with a clear reason: an ACTIVE order in the ticket blocks
+ * closure (the customer must cancel the order first). Staff are unaffected.
+ */
+async function assertOwnerCanClose(guildId: string, member: GuildMember, ticketId: number): Promise<void> {
+  const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, include: { order: true } });
+  if (!ticket || ticket.guildId !== guildId || ticket.status !== "OPEN") {
+    throw new AppError({ code: "TICKET_NOT_OPEN", friendly: "❌ This ticket no longer exists or is already closed." });
+  }
+  if (!(await canCloseTicket(guildId, member, ticket))) {
+    if (member.id === ticket.discordUserId) {
+      const blocker = await getOwnerCloseBlocker(ticket);
+      throw new AppError({ code: "ORDER_ACTIVE", friendly: blocker ?? "❌ You cannot close this ticket right now." });
+    }
+    throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only the ticket owner or staff can close this ticket." });
+  }
 }
 
 export async function createTicketFromPanel(ctx: InteractionContext): Promise<void> {
@@ -83,14 +101,11 @@ export async function confirmClose(ctx: InteractionContext): Promise<void> {
   if (!guildId) throw new AppError({ code: "NO_GUILD", friendly: "❌ This can only be used in a server." });
 
   const ticketId = Number(ctx.parts[0]);
-  const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, include: { order: true } });
-  if (!ticket || ticket.guildId !== guildId || ticket.status !== "OPEN") {
-    throw new AppError({ code: "TICKET_NOT_OPEN", friendly: "❌ This ticket no longer exists or is already closed." });
+  if (!Number.isInteger(ticketId) || ticketId <= 0) {
+    throw new AppError({ code: "BAD_TARGET", friendly: "❌ Invalid ticket in this interaction." });
   }
   const member = await requireMember(ctx);
-  if (!(await canCloseTicket(guildId, member, ticket))) {
-    throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only the ticket owner or staff can close this ticket." });
-  }
+  await assertOwnerCanClose(guildId, member, ticketId);
 
   await interaction.reply({
     content: "Are you sure you want to close this ticket? The channel will be deleted shortly after.",
@@ -98,11 +113,11 @@ export async function confirmClose(ctx: InteractionContext): Promise<void> {
     components: [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
-          .setCustomId(cid(CUSTOM_ID_PREFIX.ticket, "close-confirm", ticket.id))
+          .setCustomId(cid(CUSTOM_ID_PREFIX.ticket, "close-confirm", ticketId))
           .setLabel("Yes, Close")
           .setStyle(ButtonStyle.Danger),
         new ButtonBuilder()
-          .setCustomId(cid(CUSTOM_ID_PREFIX.ticket, "cancel-close", ticket.id))
+          .setCustomId(cid(CUSTOM_ID_PREFIX.ticket, "cancel-close", ticketId))
           .setLabel("No, Keep Open")
           .setStyle(ButtonStyle.Secondary),
       ),
@@ -118,15 +133,9 @@ export async function performClose(ctx: InteractionContext): Promise<void> {
 
   const member = await requireMember(ctx);
   const ticketId = Number(ctx.parts[0]);
-  const ticket = await prisma.ticket.findUnique({ where: { id: ticketId } });
-  if (!ticket || ticket.guildId !== guildId || ticket.status !== "OPEN") {
-    throw new AppError({ code: "TICKET_NOT_OPEN", friendly: "❌ This ticket no longer exists or is already closed." });
-  }
-  if (!(await canCloseTicket(guildId, member, ticket))) {
-    throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only the ticket owner or staff can close this ticket." });
-  }
+  await assertOwnerCanClose(guildId, member, ticketId);
 
-  await closeTicket({ guildId, ticketId: ticket.id, actorDiscordId: interaction.user.id });
+  await closeTicket({ guildId, ticketId, actorDiscordId: interaction.user.id });
   await interaction.update({ content: "✅ Ticket closed.", components: [] });
 }
 
@@ -139,15 +148,14 @@ export async function cancelClose(ctx: InteractionContext): Promise<void> {
 export async function openCloseReasonModal(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;
   if (!interaction.isButton()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
+  const guildId = interaction.guildId;
+  if (!guildId) throw new AppError({ code: "NO_GUILD", friendly: "❌ This can only be used in a server." });
   const ticketId = Number(ctx.parts[0]);
-  const ticket = await prisma.ticket.findUnique({ where: { id: ticketId } });
-  if (!ticket || ticket.status !== "OPEN") {
-    throw new AppError({ code: "TICKET_NOT_OPEN", friendly: "❌ This ticket no longer exists or is already closed." });
+  if (!Number.isInteger(ticketId) || ticketId <= 0) {
+    throw new AppError({ code: "BAD_TARGET", friendly: "❌ Invalid ticket in this interaction." });
   }
   const member = await requireMember(ctx);
-  if (!(await canCloseTicket(interaction.guildId!, member, ticket))) {
-    throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only the ticket owner or staff can close this ticket." });
-  }
+  await assertOwnerCanClose(guildId, member, ticketId);
   await interaction.showModal(
     new ModalBuilder()
       .setCustomId(cid(CUSTOM_ID_PREFIX.ticket, "close-reason"))
@@ -171,7 +179,6 @@ export async function submitCloseReason(ctx: InteractionContext): Promise<void> 
   const guildId = interaction.guildId;
   if (!guildId) throw new AppError({ code: "NO_GUILD", friendly: "❌ This can only be used in a server." });
 
-  const member = await requireMember(ctx);
   const reason = (interaction.fields.getTextInputValue("reason") ?? "").trim().slice(0, 200);
 
   // The modal does not carry the ticket id (never put state in client data we
@@ -184,9 +191,7 @@ export async function submitCloseReason(ctx: InteractionContext): Promise<void> 
   if (!ticket || ticket.guildId !== guildId || ticket.status !== "OPEN") {
     throw new AppError({ code: "TICKET_NOT_OPEN", friendly: "❌ This ticket no longer exists or is already closed." });
   }
-  if (!(await canCloseTicket(guildId, member, ticket))) {
-    throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only the ticket owner or staff can close this ticket." });
-  }
+  await assertOwnerCanClose(guildId, await requireMember(ctx), ticket.id);
 
   await closeTicket({ guildId, ticketId: ticket.id, actorDiscordId: interaction.user.id, reason });
   await interaction.reply({ content: `✅ Ticket closed — **${reason}**`, ephemeral: true });

@@ -47,6 +47,13 @@ describe("order state machine", () => {
     expect(canTransition("READY", "SUBMITTED")).toBe(false);
   });
 
+  it("requires payment to pass through AWAITING_PAYMENT", () => {
+    expect(canTransition("STAFF_REVIEW", "PAID")).toBe(false);
+    expect(canTransition("QUOTED", "PAID")).toBe(false);
+    expect(canTransition("QUOTED", "AWAITING_PAYMENT")).toBe(true);
+    expect(canTransition("AWAITING_PAYMENT", "PAID")).toBe(true);
+  });
+
   it("locks terminal states", () => {
     expect(canTransition("CANCELLED", "DRAFT")).toBe(false);
     expect(canTransition("REFUNDED", "COMPLETED")).toBe(false);

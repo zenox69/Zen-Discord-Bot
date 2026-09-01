@@ -1,4 +1,4 @@
-import { AuditCategory, type GuildSettings, type Ticket } from "@prisma/client";
+import { AuditCategory, type GuildSettings, type Order, type Ticket } from "@prisma/client";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -11,6 +11,7 @@ import {
 } from "discord.js";
 import { CUSTOM_ID_PREFIX, TICKET_DELETE_DELAY_MS, cid } from "../config/constants.js";
 import { findSettings } from "./GuildSettingsService.js";
+import { ACTIVE_ORDER_STATUSES } from "./orderTransitions.js";
 import { prisma } from "../database/prisma.js";
 import { getBotClient } from "../utils/botClient.js";
 import { isSendableChannel } from "../utils/channel.js";
@@ -107,10 +108,29 @@ export async function publishTicketPanel(guildId: string, kind: PanelKind, targe
   return channel.id;
 }
 
-export async function canCloseTicket(guildId: string, member: GuildMember, ticket: Ticket): Promise<boolean> {
-  if (member.id === ticket.discordUserId) return true;
+export async function canCloseTicket(guildId: string, member: GuildMember, ticket: Ticket & { order?: Order | null }): Promise<boolean> {
+  if (member.id === ticket.discordUserId) {
+    // The ticket owner may close freely — unless an ACTIVE order lives in
+    // this ticket: closing would orphan it (channel deleted, order stuck
+    // without its staff-control card). They must cancel the order first.
+    const order = ticket.order ?? (await prisma.order.findFirst({ where: { ticketId: ticket.id } }));
+    if (order && ACTIVE_ORDER_STATUSES.has(order.status)) return false;
+    return true;
+  }
   const settings = await findSettings(guildId);
   return settings ? isStaff(member, settings) : false;
+}
+
+/**
+ * Why the ticket owner cannot close right now (null = no blocker).
+ * Staff closures are never blocked by an active order — they may cancel it.
+ */
+export async function getOwnerCloseBlocker(ticket: Ticket & { order?: Order | null }): Promise<string | null> {
+  const order = ticket.order ?? (await prisma.order.findFirst({ where: { ticketId: ticket.id } }));
+  if (order && ACTIVE_ORDER_STATUSES.has(order.status)) {
+    return "❌ This ticket still has an **active order** in progress. Cancel the order first (or ask staff to close it after completion), then close the ticket.";
+  }
+  return null;
 }
 
 export async function createTicket(params: {
