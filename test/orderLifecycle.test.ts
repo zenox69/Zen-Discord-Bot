@@ -74,7 +74,7 @@ function makeOrder(overrides: Record<string, unknown> = {}): OrderWithRelations 
   } as unknown as OrderWithRelations;
 }
 
-function makeCtx(actorId: string, roleIds: string[]): FormCtx {
+function makeCtx(actorId: string, roleIds: string[], administrator = false): FormCtx {
   const cache = Object.assign(
     roleIds.map((id) => ({ id })),
     { has: (id: string) => roleIds.includes(id) },
@@ -83,7 +83,7 @@ function makeCtx(actorId: string, roleIds: string[]): FormCtx {
     id: actorId,
     guild: { ownerId: "owner-1" },
     roles: { cache },
-    permissions: { has: () => false },
+    permissions: { has: () => administrator },
   } as unknown as GuildMember;
   return {
     guildId: "g-1",
@@ -97,6 +97,7 @@ function makeCtx(actorId: string, roleIds: string[]): FormCtx {
 const staff = makeCtx("staff-1", ["staff-role"]);
 const otherStaff = makeCtx("staff-2", ["staff-role"]);
 const admin = makeCtx("admin-1", ["admin-role"]);
+const nativeAdmin = makeCtx("native-admin", [], true);
 const customer = makeCtx("customer-1", []);
 
 /** Concurrency token a price modal would carry (order.updatedAt at open time). */
@@ -163,6 +164,20 @@ describe("claimOrder", () => {
 
     expect(mocks.tx.order.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ data: { assignedStaffId: "admin-1" } }),
+    );
+    expect(mocks.tx.staffAssignment.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { orderId: 1, staffDiscordId: "staff-2", unassignedAt: null } }),
+    );
+  });
+
+  it("allows a native Discord Administrator to reassign an already-claimed order", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW", assignedStaffId: "staff-2" }));
+    mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
+
+    await claimOrder(1, nativeAdmin);
+
+    expect(mocks.tx.order.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { assignedStaffId: "native-admin" } }),
     );
     expect(mocks.tx.staffAssignment.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: { orderId: 1, staffDiscordId: "staff-2", unassignedAt: null } }),

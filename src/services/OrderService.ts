@@ -30,7 +30,7 @@ import { baseEmbed, COLORS, type EmbedColor } from "../utils/embeds.js";
 import { AppError, isRobloxApiError } from "../utils/errors.js";
 import { formatMoney, tDate, tDateTime } from "../utils/discordTime.js";
 import { getBotClient } from "../utils/botClient.js";
-import { isStaff } from "../utils/permissions.js";
+import { isAdmin, isStaff } from "../utils/permissions.js";
 import { rateLimiter, retryPhrase } from "../utils/rateLimiter.js";
 import { sanitizeInput, zeroPad } from "../utils/text.js";
 
@@ -94,9 +94,7 @@ function isStaffActor(ctx: FormCtx): boolean {
 }
 
 function isActorAdmin(ctx: FormCtx): boolean {
-  if (!ctx.member || !ctx.settings) return false;
-  if (ctx.member.guild.ownerId === ctx.member.id) return true;
-  return !!ctx.settings.adminRoleId && ctx.member.roles.cache.has(ctx.settings.adminRoleId);
+  return !!ctx.member && !!ctx.settings && isAdmin(ctx.member, ctx.settings);
 }
 
 /** Customer-form permission: ticket owner only — staff must not order for a customer. */
