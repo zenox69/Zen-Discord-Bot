@@ -34,6 +34,16 @@ export function isOAuthVerificationConfigured(): boolean {
   return Boolean(env.ROBLOX_OAUTH_CLIENT_ID && env.ROBLOX_OAUTH_CLIENT_SECRET && env.PUBLIC_BASE_URL);
 }
 
+/**
+ * Roblox compares redirect_uri character-for-character with the registered
+ * URLs — a trailing slash in PUBLIC_BASE_URL would silently produce
+ * "https://domain//oauth/roblox/callback" and fail authorization.
+ */
+function callbackUrl(): string {
+  const base = (env.PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
+  return `${base}${OAUTH_CALLBACK_PATH}`;
+}
+
 // ---------------------------------------------------------------------------
 // In-memory pending-state store (single replica by design)
 // ---------------------------------------------------------------------------
@@ -64,7 +74,7 @@ export function buildAuthorizeUrl(discordUserId: string, guildId: string | null)
 
   const params = new URLSearchParams({
     client_id: env.ROBLOX_OAUTH_CLIENT_ID ?? "",
-    redirect_uri: `${env.PUBLIC_BASE_URL ?? ""}${OAUTH_CALLBACK_PATH}`,
+    redirect_uri: callbackUrl(),
     scope: "openid profile",
     response_type: "code",
     state,
