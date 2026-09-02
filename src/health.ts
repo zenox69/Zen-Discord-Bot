@@ -2,6 +2,11 @@ import { createServer, type Server } from "node:http";
 import { prisma } from "./database/prisma.js";
 import { getBotClient } from "./utils/botClient.js";
 import { log } from "./utils/logger.js";
+import {
+  OAUTH_CALLBACK_PATH,
+  handleRobloxOAuthCallback,
+  isOAuthVerificationConfigured,
+} from "./services/RobloxOAuthService.js";
 
 /**
  * Minimal HTTP health endpoint for platform health checks (Northflank etc.).
@@ -46,6 +51,29 @@ export function startHealthServer(port: number): Server | null {
   if (port <= 0) return null;
 
   const server = createServer((_req, res) => {
+    // OAuth callback: full-page HTML result (never /healthz semantics).
+    if (_req.url && _req.url.startsWith(OAUTH_CALLBACK_PATH)) {
+      if (!isOAuthVerificationConfigured()) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not found");
+        return;
+      }
+      const url = new URL(_req.url, "http://localhost");
+      void handleRobloxOAuthCallback({
+        code: url.searchParams.get("code") ?? undefined,
+        state: url.searchParams.get("state") ?? undefined,
+        error: url.searchParams.get("error") ?? undefined,
+      })
+        .then((result) => {
+          res.writeHead(result.status, { "content-type": "text/html; charset=utf-8" });
+          res.end(result.html);
+        })
+        .catch(() => {
+          res.writeHead(500, { "content-type": "text/plain" });
+          res.end("internal error");
+        });
+      return;
+    }
     if (_req.url !== "/healthz") {
       res.writeHead(404, { "content-type": "text/plain" });
       res.end("not found");

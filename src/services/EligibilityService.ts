@@ -10,6 +10,7 @@ import {
 import { CUSTOM_ID_PREFIX, ELIGIBILITY_PAGE_SIZE, LIMITS, cid } from "../config/constants.js";
 import { prisma } from "../database/prisma.js";
 import { roblox } from "./RobloxService.js";
+import { robloxCloud } from "./RobloxCloudService.js";
 import { audit } from "./AuditService.js";
 import { AppError } from "../utils/errors.js";
 import { addDays, tDate } from "../utils/discordTime.js";
@@ -82,6 +83,25 @@ const STATUS_ORDER: Record<EligibilityStatus, number> = {
 // ---------------------------------------------------------------------------
 
 /**
+ * Official join-date upgrade: when the Open Cloud API key is configured and
+ * the membership is still FIRST_SEEN, fetch the real membership createTime.
+ * Only applied when the official date is OLDER than what we tracked (the
+ * official date is the truth; our first-seen date is always >= it). Any
+ * cloud failure degrades silently to the existing honest FIRST_SEEN row.
+ * Returns the upgraded date, or null (no change / not applicable).
+ */
+async function tryUpgradeToOfficialDate(
+  community: RobloxCommunity,
+  membership: CommunityMembership,
+): Promise<Date | null> {
+  if (membership.membershipDateSource !== "FIRST_SEEN") return null;
+  const official = await robloxCloud.getGroupMembership(community.robloxGroupId, membership.robloxUserId).catch(() => null);
+  if (!official?.createTime) return null;
+  if (official.createTime.getTime() >= membership.membershipStartedAt.getTime()) return null;
+  return official.createTime;
+}
+
+/**
  * Fetch the user's CURRENT Roblox group memberships once and reconcile them
  * with the stored CommunityMembership rows for every community this guild
  * tracks (enabled or not, so history survives toggling).
@@ -113,14 +133,19 @@ export async function syncMemberships(
 
     if (!existing) {
       if (isCurrentlyMember) {
+        // Prefer the OFFICIAL join date when the Open Cloud key is configured.
+        const official = await robloxCloud
+          .getGroupMembership(community.robloxGroupId, robloxUserId)
+          .catch(() => null);
+        const startDate = official?.createTime ?? now;
         await prisma.communityMembership.create({
           data: {
             robloxUserId,
             communityId: community.id,
             isCurrentlyMember: true,
             membershipFirstSeenAt: now,
-            membershipStartedAt: now,
-            membershipDateSource: "FIRST_SEEN",
+            membershipStartedAt: startDate,
+            membershipDateSource: official?.createTime ? "OFFICIAL_API" : "FIRST_SEEN",
             roleId: role?.roleId ?? null,
             roleName: role?.roleName ?? null,
             rank: role?.rank ?? null,
@@ -132,7 +157,12 @@ export async function syncMemberships(
           category: AuditCategory.ELIGIBILITY,
           action: "MEMBERSHIP_DETECTED",
           guildId,
-          details: { robloxUserId, community: community.name, membershipStartedAt: now.toISOString() },
+          details: {
+            robloxUserId,
+            community: community.name,
+            membershipStartedAt: startDate.toISOString(),
+            source: official?.createTime ? "OFFICIAL_API" : "FIRST_SEEN",
+          },
         });
       }
       continue;
@@ -143,6 +173,12 @@ export async function syncMemberships(
     if (isCurrentlyMember && !wasMember) {
       // Rejoined.
       const policy = community.leavePolicy;
+      // On rejoin, ask the official API first: the createTime of the current
+      // spell is the honest start date for this membership period.
+      const official = await robloxCloud
+        .getGroupMembership(community.robloxGroupId, robloxUserId)
+        .catch(() => null);
+      const startDate = official?.createTime ?? now;
       const data: {
         isCurrentlyMember: boolean;
         rejoinedAt: Date;
@@ -153,7 +189,7 @@ export async function syncMemberships(
         roleName: string | null;
         rank: number | null;
         membershipStartedAt?: Date;
-        membershipDateSource?: "FIRST_SEEN";
+        membershipDateSource?: "OFFICIAL_API" | "FIRST_SEEN";
         eligibilityNotificationSentAt?: null;
         eligibilityNotificationLastAttemptAt?: null;
       } = {
@@ -167,15 +203,19 @@ export async function syncMemberships(
         rank: role?.rank ?? null,
         eligibilityNotificationSentAt: null,
         eligibilityNotificationLastAttemptAt: null,
+        membershipStartedAt: startDate,
+        membershipDateSource: official?.createTime ? "OFFICIAL_API" : "FIRST_SEEN",
       };
       let action = "MEMBERSHIP_REJOINED";
       if (policy === "RESET_ON_LEAVE") {
-        data.membershipStartedAt = now;
-        data.membershipDateSource = "FIRST_SEEN";
+        data.membershipStartedAt = startDate;
+        data.membershipDateSource = official?.createTime ? "OFFICIAL_API" : "FIRST_SEEN";
         action = "MEMBERSHIP_RESTARTED";
       } else if (policy === "STAFF_REVIEW") {
-        data.membershipStartedAt = now;
-        data.membershipDateSource = "FIRST_SEEN";
+        // STAFF_REVIEW keeps manual verification authority, but we still
+        // record the official spell start for reference if there is one.
+        data.membershipStartedAt = official?.createTime ?? now;
+        data.membershipDateSource = official?.createTime ? "OFFICIAL_API" : "FIRST_SEEN";
         action = "MEMBERSHIP_REVIEW_REQUIRED";
       }
       await prisma.communityMembership.update({ where: { id: existing.id }, data });
@@ -232,6 +272,34 @@ export async function syncMemberships(
           : {}),
       },
     });
+
+    // While we are here anyway: opportunistically upgrade an approximated
+    // FIRST_SEEN date to the official join date. Cost is bounded — only
+    // rows that are still FIRST_SEEN trigger a cloud call, so steady-state
+    // refreshes of OFFICIAL_API/STAFF_VERIFIED rows cost nothing extra.
+    if (isCurrentlyMember) {
+      const upgraded = await tryUpgradeToOfficialDate(community, existing).catch(() => null);
+      if (upgraded) {
+        await prisma.communityMembership.update({
+          where: { id: existing.id },
+          data: {
+            membershipStartedAt: upgraded,
+            membershipDateSource: "OFFICIAL_API",
+          },
+        });
+        await audit({
+          category: AuditCategory.ELIGIBILITY,
+          action: "MEMBERSHIP_DATE_UPGRADED",
+          guildId,
+          details: {
+            robloxUserId,
+            community: community.name,
+            membershipStartedAt: upgraded.toISOString(),
+            source: "OFFICIAL_API",
+          },
+        });
+      }
+    }
   }
 }
 

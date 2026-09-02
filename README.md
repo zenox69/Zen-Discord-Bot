@@ -55,7 +55,9 @@ cp .env.example .env
 | `CRON_VERIFICATION_SWEEPER` | Cron for expiring pending verifications (default: every 5m). |
 | `ROBLOX_REQUEST_TIMEOUT_MS` | Per-request timeout (1000–30000, default 10000). |
 | `ROBLOX_MAX_RETRIES` | Retries for network/timeout/429/5xx (0–5, default 2). |
-| `HEALTH_PORT` | HTTP port for `GET /healthz` (default 3000, `0` = disabled). Used by platform health checks. |
+| `ROBLOX_API_KEY` | Optional Open Cloud API key. When set, tracked communities record the **official join date** (`OFFICIAL_API`) instead of the first-seen date. The key's owner must own/admin the tracked groups. |
+| `ROBLOX_OAUTH_CLIENT_ID` / `ROBLOX_OAUTH_CLIENT_SECRET` / `PUBLIC_BASE_URL` | Optional Roblox OAuth app (Creator Dashboard → User Apps). Enables `/verify oauth` ("Log in with Roblox"). `PUBLIC_BASE_URL` must be the bot's public HTTPS URL and `{PUBLIC_BASE_URL}/oauth/roblox/callback` must be registered as a redirect URI. |
+| `HEALTH_PORT` | HTTP port for `GET /healthz` (default 3000, `0` = disabled). Used by platform health checks; also serves the OAuth callback route. |
 
 The process refuses to boot with a missing or malformed variable.
 
