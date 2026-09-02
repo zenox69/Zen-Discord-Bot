@@ -9,6 +9,10 @@ export function registerVerifyInteractions(): void {
   registerInteraction(CUSTOM_ID_PREFIX.verify, "start", ["button"], (ctx) =>
     VerificationService.openStartModal(ctx),
   );
+  // Secondary method: profile-description code challenge (OAuth is primary).
+  registerInteraction(CUSTOM_ID_PREFIX.verify, "code", ["button"], (ctx) =>
+    VerificationService.openCodeModal(ctx),
+  );
   registerInteraction(CUSTOM_ID_PREFIX.verify, "start", ["modal"], (ctx) =>
     VerificationService.submitStartModal(ctx),
   );

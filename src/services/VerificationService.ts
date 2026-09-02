@@ -13,6 +13,7 @@ import { CUSTOM_ID_PREFIX, LIMITS, VERIFY_TTL_MS, cid } from "../config/constant
 import { findSettings } from "./GuildSettingsService.js";
 import { prisma } from "../database/prisma.js";
 import { roblox } from "./RobloxService.js";
+import { buildAuthorizeUrl, isOAuthVerificationConfigured } from "./RobloxOAuthService.js";
 import { audit } from "./AuditService.js";
 import { errorEmbed, successEmbed, warnEmbed } from "../utils/embeds.js";
 import { AppError } from "../utils/errors.js";
@@ -258,8 +259,51 @@ async function check(ctx: InteractionContext): Promise<void> {
   }
 }
 
-async function status(interaction: ChatInputCommandInteraction): Promise<void> {
-  const guildId = interaction.guildId;
+/**
+ * "Login with Roblox" — OAuth linking (no profile code). Replies with a
+ * link-style button that starts the authorization-code flow; the callback
+ * is handled by the health server (see RobloxOAuthService).
+ */
+async function startOAuth(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (!isOAuthVerificationConfigured()) {
+    throw new AppError({
+      code: "NOT_CONFIGURED",
+      friendly: "❌ Login-with-Roblox is not configured yet. Use `/verify roblox username:YourName` (profile code) instead.",
+    });
+  }
+  const rl = rateLimiter.consume(
+    `verify:oauth:${interaction.user.id}`,
+    LIMITS.verifyStart.limit,
+    LIMITS.verifyStart.windowMs,
+  );
+  if (!rl.ok) throw new AppError({ code: "RATE_LIMITED", friendly: retryPhrase(rl.retryAfterMs) });
+
+  const existing = await prisma.robloxAccount.findUnique({ where: { discordUserId: interaction.user.id } });
+  if (existing) {
+    throw new AppError({
+      code: "ALREADY_VERIFIED",
+      friendly: `You are already verified as **@${existing.robloxUsername}**.\nUse \`/verify unlink\` first if you want to switch accounts.`,
+    });
+  }
+
+  const authorizeUrl = buildAuthorizeUrl(interaction.user.id, interaction.guildId ?? null);
+  await interaction.reply({
+    embeds: [
+      successEmbed(
+        "🔗 ROBLOX VERIFICATION",
+        "Click the button below and **log in with your Roblox account** to link it.\n\nNo profile code needed — approving the login verifies you instantly.",
+      ),
+    ],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setURL(authorizeUrl).setLabel("Log in with Roblox").setEmoji("🔗").setStyle(ButtonStyle.Link),
+      ),
+    ],
+    ephemeral: true,
+  });
+}
+
+async function status(interaction: ChatInputCommandInteraction): Promise<void> {  const guildId = interaction.guildId;
   if (!guildId) throw new AppError({ code: "NO_GUILD", friendly: "❌ This command requires a server." });
 
   const [account, pending] = await Promise.all([
@@ -374,10 +418,12 @@ async function unlinkTarget(interaction: ChatInputCommandInteraction): Promise<v
 export const VerificationService = {
   start,
   check,
+  startOAuth,
   status,
   unlinkSelf,
   unlinkTarget,
   openStartModal,
+  openCodeModal,
   submitStartModal,
 };
 
@@ -403,7 +449,51 @@ function startModal(): ModalBuilder {
     );
 }
 
+/**
+ * Entry point behind every "Verify Roblox Account" button.
+ * OAuth (login) is the PRIMARY method: when configured, offer the one-click
+ * login first and keep the profile-code challenge as a secondary option.
+ * Without OAuth configured, open the legacy code modal directly.
+ */
 async function openStartModal(ctx: InteractionContext): Promise<void> {
+  const interaction = ctx.interaction;
+  if (!interaction.isButton()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
+
+  if (isOAuthVerificationConfigured()) {
+    const authorizeUrl = buildAuthorizeUrl(interaction.user.id, interaction.guildId ?? null);
+    await interaction.reply({
+      embeds: [
+        warnEmbed(
+          "🔗 VERIFY ROBLOX ACCOUNT",
+          [
+            "**Option 1 — Log in with Roblox (recommended):**",
+            "Click **Log in with Roblox** below and approve the login. Your account links instantly — no profile code needed.",
+            "",
+            "**Option 2 — Verification code:**",
+            "Prefer not to log in? Click **Use Verification Code** and add the code we give you to your Roblox profile About/Description.",
+          ].join("\n"),
+        ),
+      ],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setURL(authorizeUrl).setLabel("Log in with Roblox").setEmoji("🔗").setStyle(ButtonStyle.Link),
+          new ButtonBuilder()
+            .setCustomId(cid(CUSTOM_ID_PREFIX.verify, "code"))
+            .setLabel("Use Verification Code")
+            .setEmoji("✍️")
+            .setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.showModal(startModal());
+}
+
+/** Secondary method: the classic profile-description code challenge. */
+async function openCodeModal(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;
   if (!interaction.isButton()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
   await interaction.showModal(startModal());

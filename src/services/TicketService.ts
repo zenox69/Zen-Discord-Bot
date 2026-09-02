@@ -32,11 +32,15 @@ export type PanelKind = "order" | "support" | "verify" | "all";
 const VERIFY_PANEL_DESCRIPTION = [
   "Link your Roblox account to this server to unlock orders and eligibility tracking.",
   "",
-  "**How to verify:**",
+  "**How to verify — Option 1: Log in with Roblox (recommended)**",
   "1. Click **Verify Roblox Account** below.",
-  "2. Enter your Roblox username in the form.",
-  "3. The bot will give you a code — add it to your Roblox profile's *About/Description* and save.",
-  "4. Come back and press **Verify Account** to finish.",
+  "2. Click **Log in with Roblox** and approve the login in your browser.",
+  "3. Done — your account links instantly, no profile code needed.",
+  "",
+  "**Option 2: Verification code (no login)**",
+  "1. Click **Verify Roblox Account**, then **Use Verification Code**.",
+  "2. Enter your Roblox username and add the code you receive to your profile About/Description.",
+  "3. Press **Verify Account** to finish.",
 ].join("\n");
 
 export async function publishTicketPanel(guildId: string, kind: PanelKind, targetChannelId?: string): Promise<string> {

@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   audit: vi.fn(),
   findSettings: vi.fn(async () => null),
   consume: vi.fn(() => ({ ok: true })),
+  isOAuthConfigured: vi.fn(() => true),
+  buildAuthorizeUrl: vi.fn(() => "https://apis.roblox.com/oauth/v1/authorize?state=x"),
 }));
 
 vi.mock("../src/database/prisma.js", () => ({ prisma: mocks.prisma }));
@@ -25,6 +27,10 @@ vi.mock("../src/services/RobloxService.js", () => ({
 }));
 vi.mock("../src/services/AuditService.js", () => ({ audit: mocks.audit }));
 vi.mock("../src/services/GuildSettingsService.js", () => ({ findSettings: mocks.findSettings }));
+vi.mock("../src/services/RobloxOAuthService.js", () => ({
+  isOAuthVerificationConfigured: mocks.isOAuthConfigured,
+  buildAuthorizeUrl: mocks.buildAuthorizeUrl,
+}));
 vi.mock("../src/utils/rateLimiter.js", () => ({
   rateLimiter: { consume: mocks.consume },
   retryPhrase: (ms: number) => `Try again in ${Math.ceil(ms / 1000)}s`,
@@ -67,6 +73,7 @@ function buttonCtx(userId = "u1"): InteractionContext {
     deferReply: vi.fn(async () => undefined),
     editReply: vi.fn(async () => undefined),
     reply: vi.fn(async () => undefined),
+    showModal: vi.fn(async () => undefined),
   };
   return { interaction, parts: [] } as unknown as InteractionContext;
 }
@@ -126,5 +133,45 @@ describe("VerificationService.check — cache freshness", () => {
     });
     expect(mocks.prisma.robloxVerification.delete).toHaveBeenCalledWith({ where: { id: 1 } });
     expect(mocks.getProfile).not.toHaveBeenCalled();
+  });
+});
+
+describe("openStartModal — OAuth-first verify menu", () => {
+  it("offers the login-first menu when OAuth is configured", async () => {
+    mocks.isOAuthConfigured.mockReturnValue(true);
+    const ctx = buttonCtx();
+
+    await VerificationService.openStartModal(ctx);
+
+    const payload = (ctx.interaction.reply as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+      ephemeral: boolean;
+      components: { toJSON: () => unknown }[];
+    };
+    expect(payload.ephemeral).toBe(true);
+    const json = JSON.stringify(payload.components.map((row) => row.toJSON()));
+    expect(json).toContain("Log in with Roblox");
+    expect(json).toContain("Use Verification Code");
+    expect(json).toContain("verify:code");
+    expect(mocks.buildAuthorizeUrl).toHaveBeenCalledWith("u1", "g-1");
+    expect((ctx.interaction as unknown as { showModal: ReturnType<typeof vi.fn> }).showModal).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the legacy code modal when OAuth is not configured", async () => {
+    mocks.isOAuthConfigured.mockReturnValue(false);
+    const ctx = buttonCtx();
+
+    await VerificationService.openStartModal(ctx);
+
+    expect((ctx.interaction as unknown as { showModal: ReturnType<typeof vi.fn> }).showModal).toHaveBeenCalled();
+    expect(ctx.interaction.reply).not.toHaveBeenCalled();
+  });
+
+  it("the secondary code button opens the profile-code modal", async () => {
+    mocks.isOAuthConfigured.mockReturnValue(true);
+    const ctx = buttonCtx();
+
+    await VerificationService.openCodeModal(ctx);
+
+    expect((ctx.interaction as unknown as { showModal: ReturnType<typeof vi.fn> }).showModal).toHaveBeenCalled();
   });
 });
