@@ -28,7 +28,8 @@ import { log } from "../utils/logger.js";
  */
 
 const OAUTH_BASE = "https://apis.roblox.com/oauth";
-export const OAUTH_CALLBACK_PATH = "/oauth/roblox/callback";
+/** Default callback path — matches the registered redirect URL (netlify /redirect). */
+export const OAUTH_CALLBACK_PATH = "/redirect";
 const STATE_TTL_MS = 15 * 60 * 1000;
 
 /** The callback path actually used (env-configured, else the default). */

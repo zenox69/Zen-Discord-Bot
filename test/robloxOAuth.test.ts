@@ -70,7 +70,7 @@ describe("OAuth state handling", () => {
     const url = new URL(buildAuthorizeUrl("u1", "g-1"));
     expect(url.origin + url.pathname).toBe("https://apis.roblox.com/oauth/v1/authorize");
     expect(url.searchParams.get("client_id")).toBe("client-123");
-    expect(url.searchParams.get("redirect_uri")).toBe("https://bot.example.com/oauth/roblox/callback");
+    expect(url.searchParams.get("redirect_uri")).toBe("https://bot.example.com/redirect");
     expect(url.searchParams.get("response_type")).toBe("code");
     expect(url.searchParams.get("code_challenge_method")).toBe("S256");
     expect(url.searchParams.get("code_challenge")).toBeTruthy();
