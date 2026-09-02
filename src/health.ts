@@ -7,6 +7,15 @@ import {
   handleRobloxOAuthCallback,
   isOAuthVerificationConfigured,
 } from "./services/RobloxOAuthService.js";
+import { env } from "./config/env.js";
+
+/** Paths the OAuth callback accepts: the configured one, the default, and "/redirect". */
+function isOAuthCallbackPath(url: string): boolean {
+  const configured = (env.ROBLOX_OAUTH_CALLBACK_PATH || "").replace(/\/+$/, "");
+  return [configured, OAUTH_CALLBACK_PATH, "/redirect"].some(
+    (p) => p.length > 0 && (url === p || url.startsWith(`${p}?`)),
+  );
+}
 
 /**
  * Minimal HTTP health endpoint for platform health checks (Northflank etc.).
@@ -52,7 +61,7 @@ export function startHealthServer(port: number): Server | null {
 
   const server = createServer((_req, res) => {
     // OAuth callback: full-page HTML result (never /healthz semantics).
-    if (_req.url && _req.url.startsWith(OAUTH_CALLBACK_PATH)) {
+    if (_req.url && isOAuthCallbackPath(_req.url)) {
       if (!isOAuthVerificationConfigured()) {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("not found");

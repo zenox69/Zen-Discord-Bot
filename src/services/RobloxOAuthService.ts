@@ -31,6 +31,11 @@ const OAUTH_BASE = "https://apis.roblox.com/oauth";
 export const OAUTH_CALLBACK_PATH = "/oauth/roblox/callback";
 const STATE_TTL_MS = 15 * 60 * 1000;
 
+/** The callback path actually used (env-configured, else the default). */
+function oauthCallbackPath(): string {
+  return (env.ROBLOX_OAUTH_CALLBACK_PATH || OAUTH_CALLBACK_PATH).replace(/\/+$/, "");
+}
+
 export function isOAuthVerificationConfigured(): boolean {
   return Boolean(env.ROBLOX_OAUTH_CLIENT_ID && env.ROBLOX_OAUTH_CLIENT_SECRET && env.PUBLIC_BASE_URL);
 }
@@ -42,7 +47,7 @@ export function isOAuthVerificationConfigured(): boolean {
  */
 function callbackUrl(): string {
   const base = (env.PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
-  return `${base}${OAUTH_CALLBACK_PATH}`;
+  return `${base}${oauthCallbackPath()}`;
 }
 
 // ---------------------------------------------------------------------------

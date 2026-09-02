@@ -31,6 +31,12 @@ const envSchema = z.object({
   ROBLOX_OAUTH_CLIENT_ID: z.string().trim().optional(),
   ROBLOX_OAUTH_CLIENT_SECRET: z.string().trim().optional(),
   PUBLIC_BASE_URL: z.string().trim().url().optional(),
+  /**
+   * Path part of the OAuth callback, as registered in the Roblox app's
+   * Redirect URLs (e.g. "/redirect"). Must match what PUBLIC_BASE_URL +
+   * this path resolves to. Default: /oauth/roblox/callback.
+   */
+  ROBLOX_OAUTH_CALLBACK_PATH: z.string().trim().optional(),
 
   HEALTH_PORT: z.coerce.number().int().min(0).max(65535).default(3000),
 });
