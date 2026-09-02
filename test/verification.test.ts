@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   consume: vi.fn(() => ({ ok: true })),
   isOAuthConfigured: vi.fn(() => true),
   buildAuthorizeUrl: vi.fn(() => "https://apis.roblox.com/oauth/v1/authorize?state=x"),
+  syncMemberships: vi.fn(async () => undefined),
 }));
 
 vi.mock("../src/database/prisma.js", () => ({ prisma: mocks.prisma }));
@@ -31,6 +32,7 @@ vi.mock("../src/services/RobloxOAuthService.js", () => ({
   isOAuthVerificationConfigured: mocks.isOAuthConfigured,
   buildAuthorizeUrl: mocks.buildAuthorizeUrl,
 }));
+vi.mock("../src/services/EligibilityService.js", () => ({ syncMemberships: mocks.syncMemberships }));
 vi.mock("../src/utils/rateLimiter.js", () => ({
   rateLimiter: { consume: mocks.consume },
   retryPhrase: (ms: number) => `Try again in ${Math.ceil(ms / 1000)}s`,
@@ -97,6 +99,8 @@ describe("VerificationService.check — cache freshness", () => {
 
     expect(mocks.getProfile).toHaveBeenCalledWith("202", { forceRefresh: true });
     expect(mocks.prisma.$transaction).toHaveBeenCalled();
+    // Code method: eligibility tracking starts at the verification moment.
+    expect(mocks.syncMemberships).toHaveBeenCalledWith("202", "g-1");
     const payload = (ctx.interaction.editReply as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { embeds: unknown[] };
     expect(JSON.stringify(payload.embeds)).toContain("VERIFICATION SUCCESSFUL");
   });

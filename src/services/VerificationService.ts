@@ -14,10 +14,12 @@ import { findSettings } from "./GuildSettingsService.js";
 import { prisma } from "../database/prisma.js";
 import { roblox } from "./RobloxService.js";
 import { buildAuthorizeUrl, isOAuthVerificationConfigured } from "./RobloxOAuthService.js";
+import { syncMemberships } from "./EligibilityService.js";
 import { audit } from "./AuditService.js";
 import { errorEmbed, successEmbed, warnEmbed } from "../utils/embeds.js";
 import { AppError } from "../utils/errors.js";
 import { deferEphemeral, smartReply } from "../utils/interactionReply.js";
+import { log } from "../utils/logger.js";
 import { tDateTime, tRel } from "../utils/discordTime.js";
 import { rateLimiter, retryPhrase } from "../utils/rateLimiter.js";
 import { randomVerificationCode } from "../utils/text.js";
@@ -231,6 +233,15 @@ async function check(ctx: InteractionContext): Promise<void> {
       targetDiscordId: interaction.user.id,
       details: { robloxUserId: profile.id, robloxUsername: profile.name },
     });
+
+    // Code method: there is no OAuth token to read official join dates, so
+    // the eligibility clock starts NOW — seed membership tracking for this
+    // guild's tracked communities at the verification moment. Fire-and-
+    // forget: verification must succeed even if Roblox/RoProxy hiccups; the
+    // regular sync will fill any gaps later.
+    void syncMemberships(profile.id, guildId).catch((err) =>
+      log.warn(`Post-verification membership seeding failed for ${profile.id}: ${String(err)}`),
+    );
 
     await smartReply(interaction, {
       embeds: [

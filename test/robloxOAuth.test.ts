@@ -14,10 +14,12 @@ const mocks = vi.hoisted(() => ({
     $transaction: vi.fn(async (ops: unknown[]) => ops),
   },
   audit: vi.fn(),
+  syncMemberships: vi.fn(async () => undefined),
 }));
 
 vi.mock("../src/database/prisma.js", () => ({ prisma: mocks.prisma }));
 vi.mock("../src/services/AuditService.js", () => ({ audit: mocks.audit }));
+vi.mock("../src/services/EligibilityService.js", () => ({ syncMemberships: mocks.syncMemberships }));
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -216,6 +218,8 @@ describe("OAuth callback — official join-date capture", () => {
     expect(mocks.audit).toHaveBeenCalledWith(
       expect.objectContaining({ action: "MEMBERSHIP_DATE_UPGRADED" }),
     );
+    // The regular sync also runs afterwards to fill any gaps honestly.
+    expect(mocks.syncMemberships).toHaveBeenCalledWith("202", "g-1");
   });
 
   it("never fails the link when the join-date capture throws", async () => {

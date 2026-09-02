@@ -4,6 +4,7 @@ import { env } from "../config/env.js";
 import { prisma } from "../database/prisma.js";
 import { roblox } from "./RobloxService.js";
 import { getUserGroupMembership } from "./RobloxCloudService.js";
+import { syncMemberships } from "./EligibilityService.js";
 import { audit } from "./AuditService.js";
 import { RobloxApiError } from "../utils/errors.js";
 import { log } from "../utils/logger.js";
@@ -170,6 +171,8 @@ function escapeHtml(text: string): string {
  * Record the OFFICIAL join date (membership createTime) for every tracked
  * community the freshly linked user belongs to. Uses the user's own access
  * token; never writes a date we could not verify, and never fails the link.
+ * Communities the token cannot read (no group resource scope / read
+ * failure) are left to the regular sync — see the caller.
  */
 async function captureOfficialJoinDates(
   accessToken: string,
@@ -178,11 +181,14 @@ async function captureOfficialJoinDates(
 ): Promise<void> {
   if (!guildId) return;
   const communities = await prisma.robloxCommunity.findMany({ where: { guildId, enabled: true } });
+  const now = new Date();
   for (const community of communities) {
-    const membership = await getUserGroupMembership(accessToken, community.robloxGroupId, robloxUserId).catch(
+    const official = await getUserGroupMembership(accessToken, community.robloxGroupId, robloxUserId).catch(
       () => null,
     );
-    if (!membership?.createTime) continue;
+    // null = read failed OR confirmed not a member — the regular sync owns
+    // that case honestly (via RoProxy roles); never fabricate here.
+    if (!official?.createTime) continue;
 
     const existing = await prisma.communityMembership.findUnique({
       where: { robloxUserId_communityId: { robloxUserId, communityId: community.id } },
@@ -195,10 +201,10 @@ async function captureOfficialJoinDates(
           robloxUserId,
           communityId: community.id,
           isCurrentlyMember: true,
-          membershipFirstSeenAt: new Date(),
-          membershipStartedAt: membership.createTime,
+          membershipFirstSeenAt: now,
+          membershipStartedAt: official.createTime,
           membershipDateSource: "OFFICIAL_API",
-          lastMembershipCheckAt: new Date(),
+          lastMembershipCheckAt: now,
         },
       });
       await audit({
@@ -208,7 +214,7 @@ async function captureOfficialJoinDates(
         details: {
           robloxUserId,
           community: community.name,
-          membershipStartedAt: membership.createTime.toISOString(),
+          membershipStartedAt: official.createTime.toISOString(),
           source: "OFFICIAL_API",
         },
       });
@@ -216,10 +222,10 @@ async function captureOfficialJoinDates(
     }
     // Only ever replace an approximation with the official truth, and only
     // when it is older (createTime precedes any first-seen date).
-    if (existing.membershipDateSource === "FIRST_SEEN" && membership.createTime < existing.membershipStartedAt) {
+    if (existing.membershipDateSource === "FIRST_SEEN" && official.createTime < existing.membershipStartedAt) {
       await prisma.communityMembership.update({
         where: { id: existing.id },
-        data: { membershipStartedAt: membership.createTime, membershipDateSource: "OFFICIAL_API" },
+        data: { membershipStartedAt: official.createTime, membershipDateSource: "OFFICIAL_API" },
       });
       await audit({
         category: AuditCategory.ELIGIBILITY,
@@ -228,7 +234,7 @@ async function captureOfficialJoinDates(
         details: {
           robloxUserId,
           community: community.name,
-          membershipStartedAt: membership.createTime.toISOString(),
+          membershipStartedAt: official.createTime.toISOString(),
           source: "OFFICIAL_API",
         },
       });
@@ -316,11 +322,18 @@ export async function handleRobloxOAuthCallback(query: {
 
     // Capture OFFICIAL join dates while we still hold the user's token: the
     // Open Cloud group-membership createTime is the real join date for every
-    // tracked community they belong to. Failures degrade silently — the
-    // FIRST_SEEN sync remains the honest fallback.
+    // tracked community they belong to. Communities the token cannot read —
+    // and membership generally — fall back to the regular RoProxy sync, run
+    // right after, so tracking starts at link time either way. Both steps
+    // degrade silently: linking must never fail because of them.
     await captureOfficialJoinDates(accessToken, profile.id, pending.guildId).catch((err) =>
       log.warn(`Official join-date capture skipped after OAuth link: ${String(err)}`),
     );
+    if (pending.guildId) {
+      await syncMemberships(profile.id, pending.guildId).catch((err) =>
+        log.warn(`Post-link membership seeding failed for ${profile.id}: ${String(err)}`),
+      );
+    }
 
     await audit({
       category: AuditCategory.VERIFICATION,
