@@ -310,8 +310,8 @@ export async function closeTicket(params: {
   }
   const channel = ticket.channelId ? (await guild.channels.fetch(ticket.channelId).catch(() => null)) : null;
 
-  await prisma.$transaction([
-    prisma.ticket.update({
+  const { survivingOrderId } = await prisma.$transaction(async (tx) => {
+    await tx.ticket.update({
       where: { id: ticket.id },
       data: {
         status: "CLOSED",
@@ -319,30 +319,33 @@ export async function closeTicket(params: {
         closedByDiscordId: actorDiscordId,
         closeReason: reason ?? null,
       },
-    }),
+    });
     // A ticket closed with an unsubmitted draft must not keep the draft row
     // around (it would leak a form state the user can no longer reach).
-    prisma.order.deleteMany({ where: { ticketId: ticket.id, status: "DRAFT" } }),
-    prisma.ticketEvent.create({
+    await tx.order.deleteMany({ where: { ticketId: ticket.id, status: "DRAFT" } });
+    await tx.ticketEvent.create({
       data: {
         ticketId,
         type: "CLOSED",
         actorDiscordId,
         data: { reason: reason ?? null, number: ticket.number },
       },
-    }),
-  ]);
-
-  if (ticket.order) {
-    await prisma.orderEvent.create({
-      data: {
-        orderId: ticket.order.id,
-        type: "TICKET_CLOSED",
-        actorDiscordId,
-        data: { reason: reason ?? null, number: ticket.number },
-      },
     });
-  }
+    // Only reference an order that SURVIVED the close — a deleted DRAFT must
+    // never appear in order_events (foreign key constraint).
+    const surviving = await tx.order.findUnique({ where: { ticketId: ticket.id }, select: { id: true } });
+    if (surviving) {
+      await tx.orderEvent.create({
+        data: {
+          orderId: surviving.id,
+          type: "TICKET_CLOSED",
+          actorDiscordId,
+          data: { reason: reason ?? null, number: ticket.number },
+        },
+      });
+    }
+    return { survivingOrderId: surviving?.id ?? null };
+  });
 
   await audit({
     category: AuditCategory.TICKET,
@@ -354,7 +357,7 @@ export async function closeTicket(params: {
       number: ticket.number,
       channelName: ticket.channelName,
       reason: reason ?? null,
-      orderId: ticket.order?.id ?? null,
+      orderId: survivingOrderId,
     },
   });
 
