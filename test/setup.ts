@@ -4,7 +4,6 @@ process.env.DISCORD_CLIENT_ID ??= "123456789012345678";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 process.env.ROBLOX_MAX_RETRIES = "2";
 process.env.ROBLOX_REQUEST_TIMEOUT_MS = "10000";
-process.env.ROBLOX_API_KEY ??= "test-open-cloud-key";
 process.env.ROBLOX_OAUTH_CLIENT_ID ??= "client-123";
 process.env.ROBLOX_OAUTH_CLIENT_SECRET ??= "secret-456";
 process.env.PUBLIC_BASE_URL ??= "https://bot.example.com";

@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   prisma: {
     robloxAccount: { findUnique: vi.fn(), create: vi.fn() },
     robloxVerification: { deleteMany: vi.fn() },
+    robloxCommunity: { findMany: vi.fn() },
+    communityMembership: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
     $transaction: vi.fn(async (ops: unknown[]) => ops),
   },
   audit: vi.fn(),
@@ -158,5 +160,88 @@ describe("handleRobloxOAuthCallback", () => {
     expect(result.status).toBe(502);
     expect(result.html).toContain("unavailable");
     expect(result.html).not.toContain("nope");
+  });
+});
+
+describe("OAuth callback — official join-date capture", () => {
+  beforeEach(() => {
+    process.env.PUBLIC_BASE_URL = "https://bot.example.com";
+  });
+
+  it("records the OFFICIAL_API date for a tracked community using the user's token", async () => {
+    mocks.prisma.robloxCommunity.findMany.mockResolvedValue([
+      { id: 20, guildId: "g-1", robloxGroupId: "123", name: "Community A", enabled: true },
+    ]);
+    mocks.prisma.communityMembership.findUnique.mockResolvedValue({
+      id: 50,
+      robloxUserId: "202",
+      communityId: 20,
+      isCurrentlyMember: true,
+      membershipStartedAt: new Date("2026-09-01T00:00:00.000Z"),
+      membershipDateSource: "FIRST_SEEN",
+    });
+    const state = pendingFor("u1", "g-1");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: string | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/oauth/v1/token")) return jsonResponse(200, { access_token: "AT" });
+        if (url.includes("/oauth/v1/userinfo")) return jsonResponse(200, { sub: "202" });
+        if (url.includes("/users/")) {
+          return jsonResponse(200, {
+            id: 202,
+            name: "beta_user",
+            displayName: "Beta",
+            created: "2010-01-01T00:00:00.000Z",
+            isBanned: false,
+          });
+        }
+        if (url.includes("/cloud/v2/groups/123/memberships")) {
+          // The membership read must be authorized by the USER's token.
+          expect(init?.headers).toMatchObject({ authorization: "Bearer AT" });
+          return jsonResponse(200, {
+            groupMemberships: [{ createTime: "2026-06-01T00:00:00.000Z" }],
+          });
+        }
+        return Promise.reject(new Error(`unexpected fetch: ${url}`));
+      }),
+    );
+
+    const result = await handleRobloxOAuthCallback({ code: "code", state });
+    expect(result.status).toBe(200);
+    expect(mocks.prisma.communityMembership.update).toHaveBeenCalledWith({
+      where: { id: 50 },
+      data: { membershipStartedAt: expect.any(Date), membershipDateSource: "OFFICIAL_API" },
+    });
+    expect(mocks.audit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "MEMBERSHIP_DATE_UPGRADED" }),
+    );
+  });
+
+  it("never fails the link when the join-date capture throws", async () => {
+    mocks.prisma.robloxCommunity.findMany.mockRejectedValue(new Error("db hiccup"));
+    const state = pendingFor("u1", "g-1");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: string | URL) => {
+        const url = String(input);
+        if (url.includes("/oauth/v1/token")) return jsonResponse(200, { access_token: "AT" });
+        if (url.includes("/oauth/v1/userinfo")) return jsonResponse(200, { sub: "202" });
+        if (url.includes("/users/")) {
+          return jsonResponse(200, {
+            id: 202,
+            name: "beta_user",
+            displayName: "Beta",
+            created: "2010-01-01T00:00:00.000Z",
+            isBanned: false,
+          });
+        }
+        return Promise.reject(new Error(`unexpected fetch: ${url}`));
+      }),
+    );
+
+    const result = await handleRobloxOAuthCallback({ code: "code", state });
+    expect(result.status).toBe(200);
+    expect(result.html).toContain("verified");
   });
 });

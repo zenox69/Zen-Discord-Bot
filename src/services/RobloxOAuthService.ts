@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { env } from "../config/env.js";
 import { prisma } from "../database/prisma.js";
 import { roblox } from "./RobloxService.js";
+import { getUserGroupMembership } from "./RobloxCloudService.js";
 import { audit } from "./AuditService.js";
 import { RobloxApiError } from "../utils/errors.js";
 import { log } from "../utils/logger.js";
@@ -155,6 +156,76 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/**
+ * Record the OFFICIAL join date (membership createTime) for every tracked
+ * community the freshly linked user belongs to. Uses the user's own access
+ * token; never writes a date we could not verify, and never fails the link.
+ */
+async function captureOfficialJoinDates(
+  accessToken: string,
+  robloxUserId: string,
+  guildId: string | null,
+): Promise<void> {
+  if (!guildId) return;
+  const communities = await prisma.robloxCommunity.findMany({ where: { guildId, enabled: true } });
+  for (const community of communities) {
+    const membership = await getUserGroupMembership(accessToken, community.robloxGroupId, robloxUserId).catch(
+      () => null,
+    );
+    if (!membership?.createTime) continue;
+
+    const existing = await prisma.communityMembership.findUnique({
+      where: { robloxUserId_communityId: { robloxUserId, communityId: community.id } },
+    });
+    if (!existing) {
+      // Not yet in the sync table — record the official spell so eligibility
+      // is correct from the first sync.
+      await prisma.communityMembership.create({
+        data: {
+          robloxUserId,
+          communityId: community.id,
+          isCurrentlyMember: true,
+          membershipFirstSeenAt: new Date(),
+          membershipStartedAt: membership.createTime,
+          membershipDateSource: "OFFICIAL_API",
+          lastMembershipCheckAt: new Date(),
+        },
+      });
+      await audit({
+        category: AuditCategory.ELIGIBILITY,
+        action: "MEMBERSHIP_DETECTED",
+        guildId,
+        details: {
+          robloxUserId,
+          community: community.name,
+          membershipStartedAt: membership.createTime.toISOString(),
+          source: "OFFICIAL_API",
+        },
+      });
+      continue;
+    }
+    // Only ever replace an approximation with the official truth, and only
+    // when it is older (createTime precedes any first-seen date).
+    if (existing.membershipDateSource === "FIRST_SEEN" && membership.createTime < existing.membershipStartedAt) {
+      await prisma.communityMembership.update({
+        where: { id: existing.id },
+        data: { membershipStartedAt: membership.createTime, membershipDateSource: "OFFICIAL_API" },
+      });
+      await audit({
+        category: AuditCategory.ELIGIBILITY,
+        action: "MEMBERSHIP_DATE_UPGRADED",
+        guildId,
+        details: {
+          robloxUserId,
+          community: community.name,
+          membershipStartedAt: membership.createTime.toISOString(),
+          source: "OFFICIAL_API",
+        },
+      });
+    }
+  }
+}
+
 function page(title: string, bodyHtml: string, status: number): { status: number; html: string } {
   const html = [
     "<!doctype html><html><head><meta charset=\"utf-8\">",
@@ -232,6 +303,15 @@ export async function handleRobloxOAuthCallback(query: {
       }),
       prisma.robloxVerification.deleteMany({ where: { discordUserId: pending.discordUserId } }),
     ]);
+
+    // Capture OFFICIAL join dates while we still hold the user's token: the
+    // Open Cloud group-membership createTime is the real join date for every
+    // tracked community they belong to. Failures degrade silently — the
+    // FIRST_SEEN sync remains the honest fallback.
+    await captureOfficialJoinDates(accessToken, profile.id, pending.guildId).catch((err) =>
+      log.warn(`Official join-date capture skipped after OAuth link: ${String(err)}`),
+    );
+
     await audit({
       category: AuditCategory.VERIFICATION,
       action: "OAUTH_LINKED",

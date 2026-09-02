@@ -3,67 +3,36 @@ import { RobloxApiError } from "../utils/errors.js";
 import { log } from "../utils/logger.js";
 
 /**
- * RobloxCloudService — Open Cloud API access (apis.roblox.com) using the
- * developer's API key. Separate from RobloxService (public RoProxy data):
- * the API key is a secret and must NEVER be sent through a third-party
- * mirror — Open Cloud is always called directly over HTTPS.
+ * RobloxCloudService — Open Cloud reads (apis.roblox.com) authorized by the
+ * USER'S OWN OAuth access token from "Log in with Roblox". No API key and
+ * no third-party mirror: the token is used once during the OAuth callback
+ * (identity + the user's own group memberships) and never persisted.
  *
  * Guarantees:
  *  - timeout on every request (AbortController)
  *  - one retry for network/timeout/429/5xx with short backoff
- *  - serialized requests with the same pacing philosophy as RoProxy so the
- *    two services combined never burst upstream
  *  - RobloxApiError on failure — callers must degrade honestly (fall back
  *    to FIRST_SEEN), never fabricate a join date.
- *
- * Currently used for: official group-membership join dates (GroupMembership
- * createTime) — turning the FIRST_SEEN approximation into OFFICIAL_API data.
  */
 
 const CLOUD_BASE = "https://apis.roblox.com";
-
-const REQUEST_GAP_MS = 250;
-let lastRequestAt = 0;
-let requestQueue: Promise<void> = Promise.resolve();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForRequestSlot(): Promise<void> {
-  const slot = requestQueue.then(async () => {
-    const waitMs = Math.max(0, lastRequestAt + REQUEST_GAP_MS - Date.now());
-    if (waitMs > 0) await sleep(waitMs);
-    lastRequestAt = Date.now();
-  });
-  requestQueue = slot.catch(() => undefined);
-  await slot;
-}
-
-async function fetchJson<T>(label: string, url: string, init?: RequestInit): Promise<T> {
-  const apiKey = env.ROBLOX_API_KEY;
-  if (!apiKey) throw new RobloxApiError("network", label, "ROBLOX_API_KEY is not configured");
-
+async function fetchJson<T>(label: string, url: string, accessToken: string): Promise<T> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
-    await waitForRequestSlot();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), env.ROBLOX_REQUEST_TIMEOUT_MS);
     try {
       const res = await fetch(url, {
-        ...init,
+        headers: { authorization: `Bearer ${accessToken}` },
         signal: controller.signal,
-        headers: { "x-api-key": apiKey, ...(init?.headers ?? {}) },
       });
       if (!res.ok) {
-        let detail = "";
-        try {
-          const body = (await res.json()) as { message?: unknown };
-          if (typeof body.message === "string") detail = body.message;
-        } catch {
-          /* non-JSON error body */
-        }
-        const err = new RobloxApiError("http", url, `HTTP ${res.status}${detail ? ` — ${detail}` : ""}`, res.status);
+        const err = new RobloxApiError("http", url, `HTTP ${res.status}`, res.status);
         if ((res.status === 429 || res.status >= 500) && attempt === 0) {
           lastErr = err;
           await sleep(600);
@@ -98,16 +67,22 @@ export interface GroupMembershipInfo {
 }
 
 /**
- * Official membership info for one (group, user) pair.
- * Returns null when the user is not a member. Throws RobloxApiError on
- * infrastructure failure — callers degrade to FIRST_SEEN, never invent data.
+ * The logged-in user's membership in ONE group, read with their own token
+ * (`GET /cloud/v2/groups/{groupId}/memberships?filter=user == 'users/{me}'`).
+ * Returns null when they are not a member. The token's `group` resource
+ * scope governs which groups are readable; unreadable groups surface as
+ * RobloxApiError and callers degrade to FIRST_SEEN.
  */
-export async function getGroupMembership(groupId: string, userId: string): Promise<GroupMembershipInfo | null> {
+export async function getUserGroupMembership(
+  accessToken: string,
+  groupId: string,
+  userId: string,
+): Promise<GroupMembershipInfo | null> {
   const filter = `user == 'users/${userId}'`;
   const url =
     `${CLOUD_BASE}/cloud/v2/groups/${encodeURIComponent(groupId)}/memberships` +
     `?maxPageSize=1&filter=${encodeURIComponent(filter)}`;
-  const json = await fetchJson(`groupMembership:${groupId}:${userId}`, url);
+  const json = await fetchJson(`groupMembership:${groupId}:${userId}`, url, accessToken);
   const list = (json as { groupMemberships?: unknown }).groupMemberships;
   if (!Array.isArray(list) || list.length === 0) return null;
   const first = list[0] as { createTime?: unknown } | undefined;
@@ -122,7 +97,3 @@ export async function getGroupMembership(groupId: string, userId: string): Promi
   }
   return { createTime };
 }
-
-export const robloxCloud = {
-  getGroupMembership,
-};

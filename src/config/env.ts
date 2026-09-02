@@ -20,20 +20,13 @@ const envSchema = z.object({
   ROBLOX_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
 
   /**
-   * Open Cloud API key (Creator Dashboard). Optional — when set, membership
-   * sync upgrades FIRST_SEEN join dates to the OFFICIAL createTime returned
-   * by GET /cloud/v2/groups/{groupId}/memberships. The key only works for
-   * groups owned by the key's creator.
-   */
-  ROBLOX_API_KEY: z.string().trim().optional(),
-
-  /**
    * Roblox OAuth 2.0 app (Creator Dashboard → User Apps). Optional — when
    * all three are set, /verify oauth offers "Login with Roblox" account
    * linking as an alternative to the profile-code challenge. The callback
    * lands on {PUBLIC_BASE_URL}/oauth/roblox/callback, which must be
-   * registered as a redirect URI in the OAuth app. Tokens are used once for
-   * identity and are never persisted or logged.
+   * registered as a redirect URI in the OAuth app. The access token is used
+   * once (identity + the user's own group-membership join dates) and is
+   * never persisted or logged.
    */
   ROBLOX_OAUTH_CLIENT_ID: z.string().trim().optional(),
   ROBLOX_OAUTH_CLIENT_SECRET: z.string().trim().optional(),

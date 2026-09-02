@@ -59,6 +59,8 @@ function challengeEmbed(user: RobloxUserRef, code: string, marketplaceName?: str
       `5. Return here and press **Verify Account** below.`,
       "",
       "Code expires in 15 minutes.",
+      "",
+      "ℹ️ **Faster alternative:** run `/verify oauth` to verify instantly by logging in with Roblox — no profile code needed.",
     ].join("\n"),
     marketplaceName,
   );

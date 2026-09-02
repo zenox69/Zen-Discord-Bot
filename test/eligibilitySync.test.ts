@@ -10,26 +10,24 @@ const mocks = vi.hoisted(() => {
     prisma,
     // Loose on purpose — every test installs its own resolved values.
     getGroupRoles: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
-    getGroupMembership: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
     audit: vi.fn(),
   };
 });
 
 vi.mock("../src/database/prisma.js", () => ({ prisma: mocks.prisma }));
 vi.mock("../src/services/RobloxService.js", () => ({ roblox: { getGroupRoles: mocks.getGroupRoles } }));
-vi.mock("../src/services/RobloxCloudService.js", () => ({ robloxCloud: { getGroupMembership: mocks.getGroupMembership } }));
 vi.mock("../src/services/AuditService.js", () => ({ audit: mocks.audit }));
 
 import { syncMemberships } from "../src/services/EligibilityService.js";
 
-function makeCommunity(): RobloxCommunity {
+function makeCommunity(leavePolicy: string = "KEEP_ORIGINAL"): RobloxCommunity {
   return {
     id: 20,
     guildId: "g-1",
     robloxGroupId: "123",
     name: "Community A",
     requiredDays: 7,
-    leavePolicy: "KEEP_ORIGINAL",
+    leavePolicy,
     enabled: true,
   } as unknown as RobloxCommunity;
 }
@@ -58,101 +56,72 @@ beforeEach(() => {
   mocks.audit.mockResolvedValue(undefined);
 });
 
-describe("syncMemberships — official join dates", () => {
-  it("creates a new membership with OFFICIAL_API source when the cloud date exists", async () => {
+describe("syncMemberships", () => {
+  it("creates a new membership with an honest FIRST_SEEN date", async () => {
     mocks.prisma.robloxCommunity.findMany.mockResolvedValue([makeCommunity()]);
     mocks.getGroupRoles.mockResolvedValue(rolePayload(true));
     mocks.prisma.communityMembership.findUnique.mockResolvedValue(null);
-    mocks.getGroupMembership.mockResolvedValue({ createTime: new Date("2026-08-01T00:00:00.000Z") });
 
     await syncMemberships("202", "g-1");
 
     expect(mocks.prisma.communityMembership.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        membershipStartedAt: new Date("2026-08-01T00:00:00.000Z"),
-        membershipDateSource: "OFFICIAL_API",
-      }),
+      data: expect.objectContaining({ membershipDateSource: "FIRST_SEEN", isCurrentlyMember: true }),
     });
+    expect(mocks.audit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "MEMBERSHIP_DETECTED" }),
+    );
   });
 
-  it("falls back to FIRST_SEEN when the cloud lookup fails", async () => {
+  it("does nothing for non-members without an existing row", async () => {
     mocks.prisma.robloxCommunity.findMany.mockResolvedValue([makeCommunity()]);
-    mocks.getGroupRoles.mockResolvedValue(rolePayload(true));
+    mocks.getGroupRoles.mockResolvedValue(rolePayload(false));
     mocks.prisma.communityMembership.findUnique.mockResolvedValue(null);
-    mocks.getGroupMembership.mockRejectedValue(new Error("cloud down"));
 
     await syncMemberships("202", "g-1");
 
-    expect(mocks.prisma.communityMembership.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ membershipDateSource: "FIRST_SEEN" }),
-    });
+    expect(mocks.prisma.communityMembership.create).not.toHaveBeenCalled();
   });
 
-  it("upgrades an existing FIRST_SEEN membership to the older OFFICIAL_API date", async () => {
+  it("records MEMBERSHIP_LOST when a member leaves", async () => {
     mocks.prisma.robloxCommunity.findMany.mockResolvedValue([makeCommunity()]);
-    mocks.getGroupRoles.mockResolvedValue(rolePayload(true));
-    const existing = makeMembership(); // FIRST_SEEN today
-    mocks.prisma.communityMembership.findUnique.mockResolvedValue(existing);
-    mocks.getGroupMembership.mockResolvedValue({ createTime: new Date("2026-06-15T00:00:00.000Z") });
+    mocks.getGroupRoles.mockResolvedValue(rolePayload(false));
+    mocks.prisma.communityMembership.findUnique.mockResolvedValue(makeMembership());
 
     await syncMemberships("202", "g-1");
 
     expect(mocks.prisma.communityMembership.update).toHaveBeenCalledWith({
       where: { id: 50 },
-      data: expect.objectContaining({
-        membershipStartedAt: new Date("2026-06-15T00:00:00.000Z"),
-        membershipDateSource: "OFFICIAL_API",
-      }),
+      data: expect.objectContaining({ isCurrentlyMember: false }),
     });
     expect(mocks.audit).toHaveBeenCalledWith(
-      expect.objectContaining({ action: "MEMBERSHIP_DATE_UPGRADED" }),
+      expect.objectContaining({ action: "MEMBERSHIP_LOST" }),
     );
   });
 
-  it("never downgrades STAFF_VERIFIED dates", async () => {
+  it("refreshes role info on a no-change sync", async () => {
     mocks.prisma.robloxCommunity.findMany.mockResolvedValue([makeCommunity()]);
     mocks.getGroupRoles.mockResolvedValue(rolePayload(true));
-    const existing = makeMembership({
-      membershipStartedAt: new Date("2026-05-01T00:00:00.000Z"),
-      membershipDateSource: "STAFF_VERIFIED",
+    mocks.prisma.communityMembership.findUnique.mockResolvedValue(makeMembership());
+
+    await syncMemberships("202", "g-1");
+
+    expect(mocks.prisma.communityMembership.update).toHaveBeenCalledWith({
+      where: { id: 50 },
+      data: expect.objectContaining({ isCurrentlyMember: true, roleName: "Member" }),
     });
-    mocks.prisma.communityMembership.findUnique.mockResolvedValue(existing);
-
-    await syncMemberships("202", "g-1");
-
-    expect(mocks.getGroupMembership).not.toHaveBeenCalled();
-    const upgradeUpdates = mocks.prisma.communityMembership.update.mock.calls.filter(
-      (c) => (c[0] as { data: Record<string, unknown> }).data.membershipDateSource !== undefined,
-    );
-    expect(upgradeUpdates).toHaveLength(0);
   });
 
-  it("does not re-query the cloud for rows already OFFICIAL_API", async () => {
-    mocks.prisma.robloxCommunity.findMany.mockResolvedValue([makeCommunity()]);
+  it("restarts the membership spell on rejoin under RESET_ON_LEAVE", async () => {
+    mocks.prisma.robloxCommunity.findMany.mockResolvedValue([makeCommunity("RESET_ON_LEAVE")]);
     mocks.getGroupRoles.mockResolvedValue(rolePayload(true));
-    const existing = makeMembership({
-      membershipStartedAt: new Date("2026-06-15T00:00:00.000Z"),
-      membershipDateSource: "OFFICIAL_API",
-    });
-    mocks.prisma.communityMembership.findUnique.mockResolvedValue(existing);
-
-    await syncMemberships("202", "g-1");
-
-    expect(mocks.getGroupMembership).not.toHaveBeenCalled();
-  });
-
-  it("keeps the FIRST_SEEN row when the official date is not older", async () => {
-    mocks.prisma.robloxCommunity.findMany.mockResolvedValue([makeCommunity()]);
-    mocks.getGroupRoles.mockResolvedValue(rolePayload(true));
-    const existing = makeMembership(); // startedAt == today (just seen)
-    mocks.prisma.communityMembership.findUnique.mockResolvedValue(existing);
-    mocks.getGroupMembership.mockResolvedValue({ createTime: new Date("2026-09-01T12:00:00.000Z") }); // later
-
-    await syncMemberships("202", "g-1");
-
-    const upgradeUpdates = mocks.prisma.communityMembership.update.mock.calls.filter(
-      (c) => (c[0] as { data: Record<string, unknown> }).data.membershipDateSource !== undefined,
+    mocks.prisma.communityMembership.findUnique.mockResolvedValue(
+      makeMembership({ isCurrentlyMember: false, leftAt: new Date("2026-08-01T00:00:00.000Z") }),
     );
-    expect(upgradeUpdates).toHaveLength(0);
+
+    await syncMemberships("202", "g-1");
+
+    expect(mocks.audit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "MEMBERSHIP_RESTARTED" }),
+    );
   });
 });
