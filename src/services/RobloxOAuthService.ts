@@ -248,14 +248,21 @@ async function captureOfficialJoinDates(
   }
 }
 
-function page(title: string, bodyHtml: string, status: number): { status: number; html: string } {
+function page(title: string, bodyHtml: string, status: number, opts?: { success?: boolean }): { status: number; html: string } {
+  const success = opts?.success === true;
+  const icon = success
+    ? `<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" stroke="#34d39955"/><path d="m8.5 12.5 2.5 2.5 5-5.5"/></svg>`
+    : `<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" stroke="#fbbf2455"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>`;
   const html = [
     "<!doctype html><html><head><meta charset=\"utf-8\">",
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
     `<title>${escapeHtml(title)}</title>`,
     "<style>body{font-family:system-ui,sans-serif;background:#111418;color:#e8eaed;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}",
-    "main{background:#1c2128;border-radius:12px;padding:32px;max-width:420px;text-align:center}h1{font-size:1.2rem}p{line-height:1.5}</style>",
-    `</head><body><main><h1>${escapeHtml(title)}</h1>${bodyHtml}<p style="opacity:.6;margin-top:24px">You can close this window and return to Discord.</p></main></body></html>`,
+    "main{background:#1c2128;border-radius:12px;padding:36px;max-width:440px;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.35)}",
+    "h1{font-size:1.25rem;margin:18px 0 8px}p{line-height:1.6;color:#b7bdc7;margin:6px 0}",
+    "code{background:#111418;padding:2px 6px;border-radius:6px;font-size:.9em}",
+    ".brand{opacity:.55;font-size:.8rem;margin-top:26px}</style>",
+    `</head><body><main>${icon}<h1>${escapeHtml(title)}</h1>${bodyHtml}<p class="brand">Zen Eligix — you can close this window and return to Discord.</p></main></body></html>`,
   ].join("");
   return { status, html };
 }
@@ -351,9 +358,10 @@ export async function handleRobloxOAuthCallback(query: {
     });
 
     return page(
-      "Roblox account verified",
-      `<p><strong>${escapeHtml(profile.displayName)}</strong> (@${escapeHtml(profile.name)}) is now linked to your Discord account.</p><p>You can now remove any old verification code from your Roblox profile.</p>`,
+      "You're now verified! 🎉",
+      `<p><strong>${escapeHtml(profile.displayName)}</strong> (@${escapeHtml(profile.name)}) is now linked to your Discord account.</p><p>Your eligibility tracking has started. You can remove any old verification code from your Roblox profile — it's no longer needed.</p>`,
       200,
+      { success: true },
     );
   } catch (err) {
     // Never log tokens — none are persisted here and err contains none.
