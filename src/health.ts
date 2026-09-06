@@ -9,10 +9,10 @@ import {
 } from "./services/RobloxOAuthService.js";
 import { env } from "./config/env.js";
 
-/** Paths the OAuth callback accepts: the configured one, the default, and "/redirect". */
+/** Paths the OAuth callback accepts: the configured one, plus known aliases. */
 function isOAuthCallbackPath(url: string): boolean {
   const configured = (env.ROBLOX_OAUTH_CALLBACK_PATH || "").replace(/\/+$/, "");
-  return [configured, OAUTH_CALLBACK_PATH, "/redirect"].some(
+  return [configured, OAUTH_CALLBACK_PATH, "/oauth/roblox/callback", "/redirect"].some(
     (p) => p.length > 0 && (url === p || url.startsWith(`${p}?`)),
   );
 }
