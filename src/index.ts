@@ -18,7 +18,7 @@ import { createShutdown } from "./lifecycle.js";
  * with interactions, which carry full member/role data in their payloads.
  */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
   partials: [Partials.Channel],
 });
 

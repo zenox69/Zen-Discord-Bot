@@ -8,6 +8,7 @@ import { robloxCommand } from "./roblox/roblox.js";
 import { setupCommand } from "./setup/setup.js";
 import { ticketCommand } from "./ticket/ticket.js";
 import { verifyCommand } from "./verify/verify.js";
+import { voiceCommand } from "./voice/voice.js";
 
 /**
  * Central command registry — the single source of truth shared by the bot
@@ -23,4 +24,5 @@ export const allCommands: MarketplaceCommand[] = [
   customerCommand,
   productCommand,
   ticketCommand,
+  voiceCommand,
 ];
