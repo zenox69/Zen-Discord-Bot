@@ -8,7 +8,12 @@ import "dotenv/config";
 const envSchema = z.object({
   DISCORD_TOKEN: z.string().min(1, "DISCORD_TOKEN is required"),
   DISCORD_CLIENT_ID: z.string().min(1, "DISCORD_CLIENT_ID is required"),
-  GUILD_ID: z.string().optional().default(""),
+  /**
+   * Guild allowlist, comma-separated (e.g. "111..., 222..."). When set, ONLY
+   * these servers can use the bot — the bot auto-leaves any other server.
+   * Unset/empty = the bot works in any server it is added to.
+   */
+  GUILD_ID: z.string().trim().optional().default(""),
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
