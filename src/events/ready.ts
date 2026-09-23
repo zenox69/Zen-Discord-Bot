@@ -2,6 +2,7 @@ import { ActivityType, type Client } from "discord.js";
 import { log } from "../utils/logger.js";
 import { startJobs } from "../jobs/index.js";
 import { allowedGuildIds, isGuildAllowed } from "../config/guildAllowlist.js";
+import { registerSlashCommands } from "../utils/registerCommands.js";
 
 export function onReady(client: Client): void {
   if (!client.user) return;
@@ -21,6 +22,10 @@ export function onReady(client: Client): void {
           .catch((err) => log.error(`Failed to leave non-allowlisted guild ${guild.id}`, err));
       }
     }
+    // Auto-register slash commands to every allowlisted guild so a freshly
+    // added guild gets them immediately on the next deploy. Errors are
+    // non-fatal — the bot still comes online.
+    void registerSlashCommands().catch((err) => log.error("Failed to auto-register slash commands", err));
   }
   startJobs(client);
   log.info(
