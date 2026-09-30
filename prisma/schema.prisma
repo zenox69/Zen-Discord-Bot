@@ -184,7 +184,8 @@ model CommunityMembership {
   membershipFirstSeenAt DateTime
   membershipStartedAt   DateTime
   membershipDateSource  MembershipDateSource @default(FIRST_SEEN)
-  roleId                Int?
+  /// Roblox roleset IDs exceed 32-bit INT range (e.g. 12884901889).
+  roleId                BigInt?
   roleName              String?
   rank                  Int?
   lastMembershipCheckAt DateTime
