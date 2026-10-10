@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildAuthorizeUrl,
   consumeOAuthState,
+  invalidateOAuthStates,
   handleRobloxOAuthCallback,
 } from "../src/services/RobloxOAuthService.js";
+import { rateLimiter } from "../src/utils/rateLimiter.js";
 
 const mocks = vi.hoisted(() => ({
   prisma: {
@@ -34,6 +36,7 @@ function pendingFor(discordUserId = "u1", guildId: string | null = "g-1"): strin
 }
 
 beforeEach(() => {
+  rateLimiter.clear("verify:oauth:u1");
   vi.resetAllMocks();
   mocks.prisma.$transaction.mockImplementation(async (ops: unknown[]) => ops);
   mocks.prisma.robloxAccount.findUnique.mockResolvedValue(null);
@@ -66,6 +69,16 @@ afterEach(() => {
 });
 
 describe("OAuth state handling", () => {
+  it("expires exactly at the TTL boundary", () => {
+    const now = Date.now(); const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const state = pendingFor(); clock.mockReturnValue(now + 15 * 60_000);
+    expect(consumeOAuthState(state)).toBeNull();
+  });
+  it("limits all issuance entry points and invalidates sessions on unlink", () => {
+    const state = pendingFor();
+    expect(() => buildAuthorizeUrl("u1", "g-1")).toThrow();
+    invalidateOAuthStates("u1"); expect(consumeOAuthState(state)).toBeNull();
+  });
   it("builds an authorize URL with PKCE and the registered callback", () => {
     const url = new URL(buildAuthorizeUrl("u1", "g-1"));
     expect(url.origin + url.pathname).toBe("https://apis.roblox.com/oauth/v1/authorize");
@@ -109,6 +122,7 @@ describe("handleRobloxOAuthCallback", () => {
     const result = await handleRobloxOAuthCallback({ error: "access_denied", state });
     expect(result.status).toBe(400);
     expect(result.html).toContain("cancelled");
+    expect(consumeOAuthState(state)).toBeNull();
   });
 
   it("links the account end-to-end and returns a success page", async () => {

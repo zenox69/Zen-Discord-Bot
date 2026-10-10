@@ -10,7 +10,7 @@ import { reportError } from "./utils/errorBoundary.js";
 import { log } from "./utils/logger.js";
 import { setBotClient } from "./utils/botClient.js";
 import { stopJobs } from "./jobs/index.js";
-import { closeHealthServer, startHealthServer } from "./health.js";
+import { closeHealthServer, markHealthDraining, startHealthServer } from "./health.js";
 import { createShutdown } from "./lifecycle.js";
 
 /**
@@ -43,7 +43,7 @@ const healthServer = startHealthServer(env.HEALTH_PORT);
 
 // One guarded shutdown routine for every exit path (see lifecycle.ts).
 const shutdown = createShutdown({
-  stopJobs,
+  stopJobs: async () => { markHealthDraining(); await stopJobs(); },
   closeHealth: () => closeHealthServer(healthServer),
   destroyClient: () => client.destroy(),
   disconnectDb: () => prisma.$disconnect(),

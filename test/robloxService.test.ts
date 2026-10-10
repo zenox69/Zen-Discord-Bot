@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { roblox } from "../src/services/RobloxService.js";
 import { RobloxApiError } from "../src/utils/errors.js";
+import { env } from "../src/config/env.js";
 
 let callCount = 0;
 let responder: (call: number) => Response | never;
@@ -96,6 +97,32 @@ describe("getProfile", () => {
 });
 
 describe("getGroupRoles", () => {
+  it("rejects null JSON rather than reporting non-membership", async () => {
+    mockFetch(); responder = () => jsonResponse(200, null);
+    await expect(roblox.getGroupRoles("9011")).rejects.toMatchObject({ kind: "invalid" });
+  });
+  it("keeps the request timeout active while reading a stalled body", async () => {
+    const timeout = env.ROBLOX_REQUEST_TIMEOUT_MS;
+    const retries = env.ROBLOX_MAX_RETRIES;
+    env.ROBLOX_REQUEST_TIMEOUT_MS = 20;
+    env.ROBLOX_MAX_RETRIES = 0;
+    vi.stubGlobal("fetch", vi.fn((_url: string, init: RequestInit) => Promise.resolve({
+      ok: true,
+      json: () => new Promise((_resolve, reject) => {
+        init.signal!.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+      }),
+    })));
+    try {
+      await expect(roblox.getGroupRoles("9012")).rejects.toMatchObject({ kind: "timeout" });
+    } finally {
+      env.ROBLOX_REQUEST_TIMEOUT_MS = timeout;
+      env.ROBLOX_MAX_RETRIES = retries;
+    }
+  });
+  it("rejects malformed rows instead of turning them into non-membership", async () => {
+    mockFetch(); responder = () => jsonResponse(200, { data: [{ group: { id: "bad" } }] });
+    await expect(roblox.getGroupRoles("909")).rejects.toMatchObject({ kind: "invalid" });
+  });
   it("parses the current nested group/role shape", async () => {
     mockFetch();
     responder = () =>
@@ -182,6 +209,11 @@ describe("retry behaviour", () => {
 });
 
 describe("cache freshness", () => {
+  it("coalesces simultaneous uncached membership reads", async () => {
+    mockFetch(); responder = () => jsonResponse(200, { data: [] });
+    await Promise.all([roblox.getGroupRoles("919"), roblox.getGroupRoles("919")]);
+    expect(callCount).toBe(1);
+  });
   it("serves cached profiles but forceRefresh sees the new description and warms the cache", async () => {
     mockFetch();
     let description = "old text";

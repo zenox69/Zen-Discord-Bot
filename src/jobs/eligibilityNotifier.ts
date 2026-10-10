@@ -6,7 +6,7 @@ import {
   type Client,
 } from "discord.js";
 import { prisma } from "../database/prisma.js";
-import { syncMemberships } from "../services/EligibilityService.js";
+import { computeEntry, syncMemberships } from "../services/EligibilityService.js";
 import { audit } from "../services/AuditService.js";
 import { baseEmbed, COLORS } from "../utils/embeds.js";
 import { log } from "../utils/logger.js";
@@ -52,6 +52,8 @@ export async function notifyNewlyEligible(client: Client): Promise<void> {
         where: { id: candidate.id },
       });
       if (!current?.isCurrentlyMember || current.eligibilityNotificationSentAt) continue;
+      // Sync may have observed a leave/rejoin and restarted the clock.
+      if (computeEntry(community, current, new Date()).status !== "ELIGIBLE") continue;
 
       const account = await prisma.robloxAccount.findUnique({
         where: { robloxUserId: candidate.robloxUserId },

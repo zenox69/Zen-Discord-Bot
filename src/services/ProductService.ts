@@ -32,7 +32,7 @@ async function assertAddable(input: ProductInput): Promise<void> {
   if (!input.description || sanitizeInput(input.description, 1000).length < 2) {
     throw new AppError({ code: "INVALID_DESCRIPTION", friendly: "❌ Product description is required." });
   }
-  if (input.price === undefined || input.price === null || !Number.isFinite(input.price) || input.price < 0) {
+  if (input.price === undefined || input.price === null || !Number.isFinite(input.price) || input.price < 0 || input.price > 99_999_999.99) {
     throw new AppError({ code: "INVALID_PRICE", friendly: "❌ Price must be a number ≥ 0." });
   }
   const min = input.minQuantity ?? 1;
@@ -151,7 +151,7 @@ export function parseBulkLines(input: string, maxProducts: number = MAX_BULK_PRO
       continue;
     }
     const price = Number(priceRaw);
-    if (!Number.isFinite(price) || price < 0) {
+    if (!Number.isFinite(price) || price < 0 || price > 99_999_999.99) {
       failures.push({ line, raw, reason: "Price must be a number ≥ 0." });
       continue;
     }
@@ -271,7 +271,7 @@ export async function editProduct(
     data.category = sanitizeInput(input.category, 60);
   }
   if (input.price !== undefined && input.price !== null) {
-    if (!Number.isFinite(input.price) || input.price < 0) {
+    if (!Number.isFinite(input.price) || input.price < 0 || input.price > 99_999_999.99) {
       throw new AppError({ code: "INVALID_PRICE", friendly: "❌ Price must be a number ≥ 0." });
     }
     data.price = input.price;
@@ -307,11 +307,11 @@ export async function editProduct(
     });
   }
 
+  const communityIds = new Set<number>();
   if (input.communityNames) {
-    await prisma.productCommunity.deleteMany({ where: { productId: target.id } });
     for (const raw of input.communityNames) {
       const c = await findCommunityByName(guildId, raw);
-      await prisma.productCommunity.create({ data: { productId: target.id, communityId: c.id } });
+      communityIds.add(c.id);
     }
   }
 
@@ -319,7 +319,13 @@ export async function editProduct(
     throw new AppError({ code: "NO_CHANGES", friendly: "❌ Provide at least one field to change." });
   }
 
-  const updated = await prisma.product.update({ where: { id: target.id }, data });
+  const updated = await prisma.$transaction(async (tx) => {
+    if (input.communityNames) {
+      await tx.productCommunity.deleteMany({ where: { productId: target.id } });
+      for (const communityId of communityIds) await tx.productCommunity.create({ data: { productId: target.id, communityId } });
+    }
+    return tx.product.update({ where: { id: target.id }, data });
+  });
   await audit({
     category: AuditCategory.PRODUCT,
     action: "EDITED",

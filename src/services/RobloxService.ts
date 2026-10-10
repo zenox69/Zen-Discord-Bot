@@ -3,6 +3,8 @@ import { env } from "../config/env.js";
 import type { GroupRole, RobloxProfile, RobloxUserRef } from "../types/roblox.js";
 import { RobloxApiError } from "../utils/errors.js";
 import { log } from "../utils/logger.js";
+import { TtlCache } from "../utils/ttlCache.js";
+import { retryAfterMs } from "../utils/retryAfter.js";
 
 /**
  * RobloxService — the single gateway for all public Roblox data, served via
@@ -23,32 +25,6 @@ import { log } from "../utils/logger.js";
 const USERS_BASE = "https://users.roproxy.com";
 const GROUPS_BASE = "https://groups.roproxy.com";
 const THUMBNAILS_BASE = "https://thumbnails.roproxy.com";
-
-class TtlCache<T> {
-  private entries = new Map<string, { value: T; expiresAt: number }>();
-
-  get(key: string): T | undefined {
-    const entry = this.entries.get(key);
-    if (!entry) return undefined;
-    if (Date.now() > entry.expiresAt) {
-      this.entries.delete(key);
-      return undefined;
-    }
-    return entry.value;
-  }
-
-  set(key: string, value: T, ttlMs: number): void {
-    this.entries.set(key, { value, expiresAt: Date.now() + ttlMs });
-    if (this.entries.size > 5000) this.evictExpired();
-  }
-
-  private evictExpired(): void {
-    const now = Date.now();
-    for (const [key, entry] of this.entries) {
-      if (now > entry.expiresAt) this.entries.delete(key);
-    }
-  }
-}
 
 const usernameCache = new TtlCache<RobloxUserRef | null>();
 const profileCache = new TtlCache<RobloxProfile | null>();
@@ -79,14 +55,25 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   await waitForRequestSlot();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), env.ROBLOX_REQUEST_TIMEOUT_MS);
-  let res: Response;
   try {
-    res = await fetch(url, {
+    const res = await fetch(url, {
       ...init,
       signal: controller.signal,
       headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
     });
+    if (!res.ok) {
+      // Never depend on an error body's delivery or echo upstream text.
+      await res.body?.cancel();
+      throw new RobloxApiError("http", url, `HTTP ${res.status}`, res.status, retryAfterMs(res.headers.get("retry-after")));
+    }
+    try {
+      return (await res.json()) as T;
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      throw new RobloxApiError("invalid", url, "Response was not valid JSON");
+    }
   } catch (err) {
+    if (err instanceof RobloxApiError) throw err;
     if (err instanceof Error && err.name === "AbortError") {
       throw new RobloxApiError("timeout", url, `Timed out after ${env.ROBLOX_REQUEST_TIMEOUT_MS}ms`);
     }
@@ -95,29 +82,6 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     clearTimeout(timer);
   }
 
-  if (!res.ok) {
-    let detail = "";
-    try {
-      const body = (await res.json()) as { error?: unknown; message?: unknown };
-      detail =
-        typeof body.error === "string"
-          ? body.error
-          : typeof body.message === "string"
-            ? body.message
-            : "";
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new RobloxApiError("http", url, `HTTP ${res.status}${detail ? ` — ${detail}` : ""}`, res.status);
-  }
-
-  let json: unknown;
-  try {
-    json = await res.json();
-  } catch {
-    throw new RobloxApiError("invalid", url, "Response was not valid JSON");
-  }
-  return json as T;
 }
 
 async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
@@ -133,7 +97,8 @@ async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
           err.kind === "timeout" ||
           (err.kind === "http" && ((err.status ?? 0) === 429 || (err.status ?? 0) >= 500)));
       if (!retriable || attempt === env.ROBLOX_MAX_RETRIES) break;
-      const backoff = Math.min(8000, 400 * 2 ** attempt) + Math.floor(Math.random() * 250);
+      if ((err.retryAfterMs ?? 0) > 8000) break;
+      const backoff = Math.max(err.retryAfterMs ?? 0, Math.min(8000, 400 * 2 ** attempt) + Math.floor(Math.random() * 250));
       log.warn(`Roblox request ${label} failed — retry ${attempt + 1}/${env.ROBLOX_MAX_RETRIES} in ${backoff}ms`);
       await sleep(backoff);
     }
@@ -142,6 +107,18 @@ async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
 }
 
 const USERNAME_RE = /^[A-Za-z0-9_]{2,20}$/;
+const ID_RE = /^[1-9]\d{0,19}$/;
+function assertUserId(id: string): void {
+  if (!ID_RE.test(id)) throw new RobloxApiError("invalid", "user", "Invalid Roblox user ID");
+}
+const inFlight = new Map<string, Promise<unknown>>();
+function sharedRead<T>(key: string, action: () => Promise<T>): Promise<T> {
+  const existing = inFlight.get(key);
+  if (existing) return existing as Promise<T>;
+  const request = action().finally(() => { inFlight.delete(key); });
+  inFlight.set(key, request);
+  return request;
+}
 
 // ---------------------------------------------------------------------------
 // 1. Username -> user id
@@ -157,11 +134,12 @@ async function resolveUsernameOnce(rawUsername: string): Promise<RobloxUserRef |
       body: JSON.stringify({ usernames: [username], excludeBannedUsers: false }),
     }),
   );
-  if (!Array.isArray(json.data)) {
+  if (!json || !Array.isArray(json.data)) {
     throw new RobloxApiError("invalid", url, "Username response did not contain a data array");
   }
   const entry = json.data[0];
-  if (!entry || (typeof entry.id !== "number" && typeof entry.id !== "string")) return null;
+  if (!entry) return null;
+  if (!ID_RE.test(String(entry.id))) throw new RobloxApiError("invalid", url, "Username response had an invalid ID");
   const name = typeof entry.name === "string" ? entry.name : username;
   return {
     id: String(entry.id),
@@ -177,12 +155,13 @@ async function resolveUsernameOnce(rawUsername: string): Promise<RobloxUserRef |
  */
 async function resolveUsername(rawUsername: string): Promise<RobloxUserRef | null> {
   const key = rawUsername.trim().toLowerCase();
+  if (!USERNAME_RE.test(key)) return null;
   const cached = usernameCache.get(key);
   if (cached !== undefined) return cached;
 
   let result: RobloxUserRef | null;
   try {
-    result = await resolveUsernameOnce(rawUsername);
+    result = await sharedRead(`username:${key}`, () => resolveUsernameOnce(rawUsername));
   } catch (err) {
     // The public API answers 400/404 for usernames it cannot find.
     if (err instanceof RobloxApiError && ((err.status ?? 0) === 400 || (err.status ?? 0) === 404)) {
@@ -210,6 +189,7 @@ async function getProfileOnce(userId: string): Promise<RobloxProfile | null> {
   if ((typeof id !== "number" && typeof id !== "string") || typeof name !== "string") {
     throw new RobloxApiError("invalid", url, "Profile response was missing id or name");
   }
+  if (String(id) !== userId || !ID_RE.test(String(id))) throw new RobloxApiError("invalid", url, "Profile response identity mismatch");
   const created = typeof json.created === "string" ? new Date(json.created) : null;
   if (!created || Number.isNaN(created.getTime())) {
     throw new RobloxApiError("invalid", url, "Profile response had an invalid created date");
@@ -232,6 +212,7 @@ async function getProfileOnce(userId: string): Promise<RobloxProfile | null> {
  * who just edited their profile description must not be judged on stale data.
  */
 async function getProfile(userId: string, opts?: { forceRefresh?: boolean }): Promise<RobloxProfile | null> {
+  assertUserId(userId);
   if (!opts?.forceRefresh) {
     const cached = profileCache.get(userId);
     if (cached !== undefined) return cached;
@@ -239,7 +220,7 @@ async function getProfile(userId: string, opts?: { forceRefresh?: boolean }): Pr
 
   let result: RobloxProfile | null;
   try {
-    result = await getProfileOnce(userId);
+    result = opts?.forceRefresh ? await getProfileOnce(userId) : await sharedRead(`profile:${userId}`, () => getProfileOnce(userId));
   } catch (err) {
     if (err instanceof RobloxApiError && (err.status ?? 0) === 404) {
       result = null;
@@ -267,7 +248,7 @@ async function getAvatarOnce(userId: string): Promise<string> {
       const json = await withRetry(`avatar:${userId}`, () =>
         fetchJson<{ data?: Array<{ imageUrl?: unknown }> }>(url),
       );
-      if (!Array.isArray(json.data)) {
+      if (!json || !Array.isArray(json.data)) {
         throw new RobloxApiError("invalid", url, "Avatar response did not contain a data array");
       }
       const imageUrl = json.data[0]?.imageUrl;
@@ -282,9 +263,10 @@ async function getAvatarOnce(userId: string): Promise<string> {
 }
 
 async function getAvatarHeadshotUrl(userId: string): Promise<string> {
+  assertUserId(userId);
   const cached = avatarCache.get(userId);
   if (cached !== undefined) return cached;
-  const url = await getAvatarOnce(userId);
+  const url = await sharedRead(`avatar:${userId}`, () => getAvatarOnce(userId));
   avatarCache.set(userId, url, ROBLOX_CACHE_TTL_MS.avatar);
   return url;
 }
@@ -298,16 +280,17 @@ async function getGroupRolesOnce(userId: string): Promise<GroupRole[]> {
   const json = await withRetry(`groups:${userId}`, () =>
     fetchJson<{ data?: Array<Record<string, unknown>> }>(url),
   );
-  if (!Array.isArray(json.data)) {
+  if (!json || !Array.isArray(json.data)) {
     throw new RobloxApiError("invalid", url, "Group membership response did not contain a data array");
   }
   const rows = json.data;
   const out: GroupRole[] = [];
   for (const row of rows) {
+    if (!row || typeof row !== "object") throw new RobloxApiError("invalid", url, "Malformed membership row");
     // Current Roblox/RoProxy shape: { group: { id, name }, role: { id, name, rank } }
     const group = row.group as Record<string, unknown> | undefined;
     const role = row.role as Record<string, unknown> | undefined;
-    if (group && (typeof group.id === "number" || typeof group.id === "string")) {
+    if (group && ID_RE.test(String(group.id))) {
       out.push({
         groupId: String(group.id),
         groupName: typeof group.name === "string" ? group.name : "Unknown group",
@@ -319,7 +302,7 @@ async function getGroupRolesOnce(userId: string): Promise<GroupRole[]> {
     }
     // Legacy flat shape: { group_id, name, role_id, rank_name, rank }
     const groupId = row.group_id;
-    if (typeof groupId !== "number" && typeof groupId !== "string") continue;
+    if (!ID_RE.test(String(groupId))) throw new RobloxApiError("invalid", url, "Malformed membership group ID");
     out.push({
       groupId: String(groupId),
       groupName: typeof row.name === "string" ? row.name : "Unknown group",
@@ -339,11 +322,12 @@ async function getGroupRolesOnce(userId: string): Promise<GroupRole[]> {
  * revalidation must not trust a stale membership snapshot).
  */
 async function getGroupRoles(userId: string, opts?: { forceRefresh?: boolean }): Promise<GroupRole[]> {
+  assertUserId(userId);
   if (!opts?.forceRefresh) {
     const cached = groupsCache.get(userId);
     if (cached !== undefined) return cached;
   }
-  const roles = await getGroupRolesOnce(userId);
+  const roles = opts?.forceRefresh ? await getGroupRolesOnce(userId) : await sharedRead(`groups:${userId}`, () => getGroupRolesOnce(userId));
   groupsCache.set(userId, roles, ROBLOX_CACHE_TTL_MS.groups);
   return roles;
 }

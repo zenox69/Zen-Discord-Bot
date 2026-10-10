@@ -2,7 +2,6 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  GuildMember,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -32,6 +31,8 @@ import {
 import { AppError } from "../utils/errors.js";
 import { clearDefer, deferEphemeral } from "../utils/interactionReply.js";
 import type { InteractionContext } from "../handlers/interactionHandler.js";
+import { getInteractionMember, requireStaff } from "../utils/permissions.js";
+import { assertFormAccess, assertStaffCanManage } from "../services/OrderService.js";
 
 /**
  * Order form + staff control interactions.
@@ -60,7 +61,7 @@ async function getFormContext(interaction: FormInteraction): Promise<{ ctx: Form
   if (!channel || channel.partial) throw new AppError({ code: "NO_CHANNEL", friendly: "❌ Channel context lost.", expected: false });
   const message = interaction.message;
   if (!message) throw new AppError({ code: "MSG_GONE", friendly: "❌ The form message no longer exists. Please open a new ticket.", expected: false });
-  const member = interaction.member instanceof GuildMember ? interaction.member : undefined;
+  const member = await getInteractionMember(interaction);
   const settings = await findSettings(guildId);
   const ctx: FormCtx = { guildId, channelId: channel.id, actorId: interaction.user.id, member, settings };
   const editable: EditableMessage = { edit: (o) => message.edit(o) };
@@ -72,8 +73,10 @@ async function getStaffContext(interaction: ButtonInteraction | ModalSubmitInter
   if (!guildId) throw new AppError({ code: "NO_GUILD", friendly: "❌ This can only be used in a server." });
   const channel = interaction.channel;
   if (!channel || channel.partial) throw new AppError({ code: "NO_CHANNEL", friendly: "❌ Channel context lost.", expected: false });
-  const member = interaction.member instanceof GuildMember ? interaction.member : undefined;
+  const member = await getInteractionMember(interaction);
   const settings = await findSettings(guildId);
+  if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not configured." });
+  requireStaff(member, settings);
   return { guildId, channelId: channel.id, actorId: interaction.user.id, member, settings };
 }
 
@@ -84,21 +87,23 @@ async function getStaffContext(interaction: ButtonInteraction | ModalSubmitInter
 export async function handleSelectProduct(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;
   if (!interaction.isStringSelectMenu()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
+  await deferEphemeral(interaction);
   const { ctx: formCtx, message } = await getFormContext(interaction);
   const value = interaction.values[0];
   if (!value) throw new AppError({ code: "NO_VALUE", friendly: "❌ No product selected." });
   await handleProductSelect(Number(ctx.parts[0]), value, formCtx, message);
+  await clearDefer(interaction);
 }
 
 export async function handleSelectCommunity(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;
   if (!interaction.isStringSelectMenu()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
+  await deferEphemeral(interaction);
   const { ctx: formCtx, message } = await getFormContext(interaction);
   const value = interaction.values[0];
   if (!value) throw new AppError({ code: "NO_VALUE", friendly: "❌ No community selected." });
   // Eligibility gate does a live Roblox sync — defer so the 3-second
   // window can't drop the response; the form message itself carries the UI.
-  await deferEphemeral(interaction);
   try {
     await handleCommunitySelect(Number(ctx.parts[0]), value, formCtx, message);
   } finally {
@@ -115,9 +120,7 @@ export async function handleContinue(ctx: InteractionContext): Promise<void> {
     include: { product: true, community: true, ticket: true },
   });
   if (!order || order.status !== "DRAFT") throw new AppError({ code: "ORDER_GONE", friendly: "❌ This order no longer exists in draft." });
-  if (order.discordUserId !== formCtx.actorId) {
-    throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only the customer who opened this ticket can continue the order form." });
-  }
+  assertFormAccess(order, formCtx);
   await interaction.showModal(buildOrderModal(order));
 }
 
@@ -128,7 +131,7 @@ export async function handleOrderModal(ctx: InteractionContext): Promise<void> {
   if (!guildId) throw new AppError({ code: "NO_GUILD", friendly: "❌ This can only be used in a server." });
   const channel = interaction.channel;
   if (!channel || channel.partial) throw new AppError({ code: "NO_CHANNEL", friendly: "❌ Channel context lost.", expected: false });
-  const member = interaction.member instanceof GuildMember ? interaction.member : undefined;
+  const member = await getInteractionMember(interaction);
   const settings = await findSettings(guildId);
   const formCtx: FormCtx = { guildId, channelId: channel.id, actorId: interaction.user.id, member, settings };
 
@@ -146,13 +149,16 @@ export async function handleOrderModal(ctx: InteractionContext): Promise<void> {
 export async function handleBackOrder(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;
   if (!interaction.isButton()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
+  await deferEphemeral(interaction);
   const { ctx: formCtx, message } = await getFormContext(interaction);
   await handleBack(Number(ctx.parts[0]), ctx.parts[1] ?? "1", formCtx, message);
+  await clearDefer(interaction);
 }
 
 export async function handleSubmitOrder(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;
   if (!interaction.isButton()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
+  await deferEphemeral(interaction);
   const { ctx: formCtx, message } = await getFormContext(interaction);
   const orderId = Number(ctx.parts[0]);
   const result = await submitOrder(orderId, formCtx);
@@ -177,6 +183,7 @@ export async function handleSubmitOrder(ctx: InteractionContext): Promise<void> 
       ],
       embeds: [],
     });
+    await clearDefer(interaction);
     return;
   }
   await message.edit({
@@ -184,17 +191,20 @@ export async function handleSubmitOrder(ctx: InteractionContext): Promise<void> 
     components: [],
     embeds: [],
   });
+  await clearDefer(interaction);
 }
 
 export async function handleCancelForm(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;
   if (!interaction.isButton()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
+  await deferEphemeral(interaction);
   const { ctx: formCtx, message } = await getFormContext(interaction);
   // Step-1 buttons embed a ticket ref ("ticket:<id>"), which the colon-split
   // custom-id grammar delivers as two parts; later steps pass a bare order id.
   const [kind, kindId] = ctx.parts;
   await cancelOrder(kind === "ticket" ? `ticket:${kindId}` : (kind ?? "ticket:0"), formCtx);
   await message.edit({ content: "❌ Order cancelled. If you need anything else, open a new ticket or ask staff.", components: [], embeds: [] });
+  await clearDefer(interaction);
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +226,10 @@ export async function openSetPriceModal(ctx: InteractionContext): Promise<void> 
   // Capture the order's updatedAt NOW: the modal carries it as a concurrency
   // token, so a stale modal submitted after another staff member's edit is
   // rejected instead of overwriting their change.
-  const order = await prisma.order.findUnique({ where: { id: orderId }, select: { updatedAt: true } });
+  const formCtx = await getStaffContext(interaction);
+  const order = await prisma.order.findUnique({ where: { id: orderId }, include: { product: true, community: true, ticket: true } });
   if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ Order not found.", expected: false });
+  assertStaffCanManage(order, formCtx);
   await interaction.showModal(
     new ModalBuilder()
       .setCustomId(cid(CUSTOM_ID_PREFIX.order, "set-price", String(orderId), String(order.updatedAt.getTime())))
@@ -295,6 +307,10 @@ export async function handleConfirmComplete(ctx: InteractionContext): Promise<vo
 export async function openCancelOrderModal(ctx: InteractionContext): Promise<void> {
   const interaction = ctx.interaction;
   if (!interaction.isButton()) throw new AppError({ code: "BAD_INTERACTION", friendly: "❌ Invalid interaction." });
+  const formCtx = await getStaffContext(interaction);
+  const order = await prisma.order.findUnique({ where: { id: Number(requiredPart(ctx, 0)) }, include: { product: true, community: true, ticket: true } });
+  if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ Order not found." });
+  assertStaffCanManage(order, formCtx);
   await interaction.showModal(
     new ModalBuilder()
       .setCustomId(cid(CUSTOM_ID_PREFIX.order, "cancel-reason", requiredPart(ctx, 0)))

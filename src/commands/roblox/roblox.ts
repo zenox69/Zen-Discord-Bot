@@ -4,7 +4,6 @@ import {
   ButtonBuilder,
   ButtonStyle,
   type ChatInputCommandInteraction,
-  type GuildMember,
 } from "discord.js";
 import { CUSTOM_ID_PREFIX, LIMITS, cid } from "../../config/constants.js";
 import { prisma } from "../../database/prisma.js";
@@ -16,7 +15,7 @@ import { AppError } from "../../utils/errors.js";
 import { deferEphemeral, smartReply } from "../../utils/interactionReply.js";
 import { daysSince, tDate } from "../../utils/discordTime.js";
 import { rateLimiter, retryPhrase } from "../../utils/rateLimiter.js";
-import { requireStaff } from "../../utils/permissions.js";
+import { getInteractionMember, requireStaff } from "../../utils/permissions.js";
 import type { MarketplaceCommand } from "../../handlers/commandHandler.js";
 
 async function profile(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -122,7 +121,8 @@ export const robloxCommand: MarketplaceCommand = {
       const guildId = interaction.guildId;
       if (!guildId) throw new AppError({ code: "NO_GUILD", friendly: "❌ This command requires a server." });
       const settings = await findSettings(guildId);
-      if (settings) requireStaff(interaction.member as GuildMember, settings);
+      if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not configured." });
+      requireStaff(await getInteractionMember(interaction), settings);
       return VerificationService.unlinkTarget(interaction);
     }
     return profile(interaction);

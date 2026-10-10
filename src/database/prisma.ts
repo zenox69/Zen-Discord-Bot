@@ -1,4 +1,5 @@
 import { PrismaClient } from "@prisma/client";
+import { log } from "../utils/logger.js";
 
 /**
  * Single Prisma client for the whole process.
@@ -6,5 +7,7 @@ import { PrismaClient } from "@prisma/client";
  * and membership state. Discord is only the interface.
  */
 export const prisma = new PrismaClient({
-  log: ["warn", "error"],
+  log: [{ emit: "event", level: "warn" }, { emit: "event", level: "error" }],
 });
+prisma.$on("warn", (event) => log.warn("Prisma warning", event.message));
+prisma.$on("error", (event) => log.error("Prisma error", event.message));

@@ -6,8 +6,10 @@ import { roblox } from "./RobloxService.js";
 import { getUserGroupMembership } from "./RobloxCloudService.js";
 import { syncMemberships } from "./EligibilityService.js";
 import { audit } from "./AuditService.js";
-import { RobloxApiError } from "../utils/errors.js";
+import { AppError, RobloxApiError } from "../utils/errors.js";
 import { log } from "../utils/logger.js";
+import { LIMITS } from "../config/constants.js";
+import { rateLimiter, retryPhrase } from "../utils/rateLimiter.js";
 
 /**
  * RobloxOAuthService — "Login with Roblox" account linking via the Open
@@ -67,13 +69,16 @@ const pendingStates = new Map<string, PendingOAuth>();
 function pruneExpiredStates(): void {
   const now = Date.now();
   for (const [key, entry] of pendingStates) {
-    if (entry.expiresAt < now) pendingStates.delete(key);
+    if (entry.expiresAt <= now) pendingStates.delete(key);
   }
 }
 
-/** Create the authorize URL for this Discord user. Never throws. */
+/** All entry points share issuance rate limits and bounded pending state. */
 export function buildAuthorizeUrl(discordUserId: string, guildId: string | null): string {
   pruneExpiredStates();
+  const rl = rateLimiter.consume(`verify:oauth:${discordUserId}`, LIMITS.verifyStart.limit, LIMITS.verifyStart.windowMs);
+  if (!rl.ok) throw new AppError({ code: "RATE_LIMITED", friendly: retryPhrase(rl.retryAfterMs) });
+  if (pendingStates.size >= 2000) throw new AppError({ code: "OAUTH_BUSY", friendly: "❌ Verification is busy. Please try again shortly." });
   const state = randomBytes(24).toString("hex");
   const codeVerifier = randomBytes(48).toString("base64url");
   const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
@@ -96,7 +101,7 @@ export function consumeOAuthState(state: string): PendingOAuth | null {
   const entry = pendingStates.get(state);
   if (!entry) return null;
   pendingStates.delete(state);
-  if (entry.expiresAt < Date.now()) return null;
+  if (entry.expiresAt <= Date.now()) return null;
   return entry;
 }
 
@@ -104,6 +109,10 @@ export function consumeOAuthState(state: string): PendingOAuth | null {
 // Token exchange + identity (direct to apis.roblox.com — never via RoProxy;
 // the client secret must not touch third-party mirrors)
 // ---------------------------------------------------------------------------
+
+export function invalidateOAuthStates(discordUserId: string): void {
+  for (const [key, entry] of pendingStates) if (entry.discordUserId === discordUserId) pendingStates.delete(key);
+}
 
 async function exchangeCodeForToken(code: string, codeVerifier: string): Promise<string> {
   const controller = new AbortController();
@@ -152,7 +161,7 @@ async function fetchOAuthUserInfo(accessToken: string): Promise<{ sub: string }>
       throw new RobloxApiError("http", "oauth/userinfo", `HTTP ${res.status}`, res.status);
     }
     const json = (await res.json()) as { sub?: unknown };
-    if (typeof json.sub !== "string" || !/^\d+$/.test(json.sub)) {
+    if (typeof json.sub !== "string" || !/^[1-9]\d{0,19}$/.test(json.sub)) {
       throw new RobloxApiError("invalid", "oauth/userinfo", "Userinfo response had no valid sub");
     }
     return { sub: json.sub };
@@ -277,11 +286,7 @@ export async function handleRobloxOAuthCallback(query: {
   state?: string;
   error?: string;
 }): Promise<{ status: number; html: string }> {
-  if (query.error) {
-    log.warn(`Roblox OAuth callback reported error: ${query.error}`);
-    return page("Verification cancelled", "<p>Roblox reported that the login was cancelled or failed. Run <code>/verify oauth</code> again.</p>", 400);
-  }
-  if (!query.code || !query.state) {
+  if (!query.state || (!query.code && !query.error)) {
     return page("Invalid request", "<p>This callback URL must be opened through the Discord verification button.</p>", 400);
   }
 
@@ -289,9 +294,13 @@ export async function handleRobloxOAuthCallback(query: {
   if (!pending) {
     return page("Link expired", "<p>This verification link has expired or was already used. Run <code>/verify oauth</code> again.</p>", 400);
   }
+  if (query.error) {
+    log.warn("Roblox OAuth login cancelled or rejected");
+    return page("Verification cancelled", "<p>Roblox reported that the login was cancelled or failed. Run <code>/verify oauth</code> again.</p>", 400);
+  }
 
   try {
-    const accessToken = await exchangeCodeForToken(query.code, pending.codeVerifier);
+    const accessToken = await exchangeCodeForToken(query.code!, pending.codeVerifier);
     const userInfo = await fetchOAuthUserInfo(accessToken);
 
     // Identity from the token + public profile for ban/username truth.
@@ -364,7 +373,10 @@ export async function handleRobloxOAuthCallback(query: {
       { success: true },
     );
   } catch (err) {
-    // Never log tokens — none are persisted here and err contains none.
+    if (err && typeof err === "object" && "code" in err && err.code === "P2002") {
+      return page("Account already linked", "<p>This Discord or Roblox account was already verified. Check <code>/verify status</code> before trying again.</p>", 409);
+    }
+    // Diagnostics pass through the shared redactor.
     log.error("Roblox OAuth callback failed", err);
     return page(
       "Verification failed",

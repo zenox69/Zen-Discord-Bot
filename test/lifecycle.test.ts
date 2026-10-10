@@ -4,7 +4,7 @@ import { createShutdown, type ShutdownDeps } from "../src/lifecycle.js";
 function makeDeps(overrides: Partial<ShutdownDeps> = {}) {
   const calls: string[] = [];
   const deps: ShutdownDeps = {
-    stopJobs: () => calls.push("stopJobs"),
+    stopJobs: () => { calls.push("stopJobs"); },
     closeHealth: async () => {
       calls.push("closeHealth");
     },
@@ -33,6 +33,14 @@ function gatedCloseHealth(onRun?: () => void) {
 }
 
 describe("createShutdown", () => {
+  it("drains active jobs before destroying the client or disconnecting the database", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const { deps, calls } = makeDeps({ stopJobs: () => pending });
+    const shutdown = createShutdown(deps)("SIGTERM");
+    await Promise.resolve(); expect(calls).not.toContain("disconnectDb");
+    release(); await shutdown; expect(calls).toContain("disconnectDb");
+  });
   it("runs cleanup steps in order and exits 0 by default", async () => {
     const { deps, calls } = makeDeps();
     await createShutdown(deps)("SIGTERM");

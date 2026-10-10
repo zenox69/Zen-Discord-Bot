@@ -6,6 +6,8 @@ import type {
 import { parseCustomId } from "../config/constants.js";
 import { handleFatal } from "../utils/errorBoundary.js";
 import { log } from "../utils/logger.js";
+import { findSettings } from "../services/GuildSettingsService.js";
+import { AppError } from "../utils/errors.js";
 
 export type ComponentInteraction =
   | ButtonInteraction
@@ -64,7 +66,13 @@ export async function routeInteraction(interaction: ComponentInteraction): Promi
   // component interactions too (GUILD_CREATE omits owner_id).
   const guild = interaction.guild;
   if (guild && !guild.ownerId) await guild.fetch().catch(() => undefined);
-  await handleFatal(() => registration.run({ interaction, parts }), {
+  await handleFatal(async () => {
+    if (!interaction.guildId || !interaction.guild) throw new AppError({ code: "NO_GUILD", friendly: "❌ This action requires a server." });
+    const settings = await findSettings(interaction.guildId);
+    if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ An administrator must run `/setup` first." });
+    if (!settings.enabled) throw new AppError({ code: "MARKETPLACE_DISABLED", friendly: "❌ The marketplace is currently disabled on this server." });
+    await registration.run({ interaction, parts });
+  }, {
     interaction,
     guildId: interaction.guildId ?? undefined,
   });

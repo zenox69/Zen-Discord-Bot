@@ -13,7 +13,7 @@ import { CUSTOM_ID_PREFIX, LIMITS, VERIFY_TTL_MS, cid } from "../config/constant
 import { findSettings } from "./GuildSettingsService.js";
 import { prisma } from "../database/prisma.js";
 import { roblox } from "./RobloxService.js";
-import { buildAuthorizeUrl, isOAuthVerificationConfigured } from "./RobloxOAuthService.js";
+import { buildAuthorizeUrl, invalidateOAuthStates, isOAuthVerificationConfigured } from "./RobloxOAuthService.js";
 import { syncMemberships } from "./EligibilityService.js";
 import { audit } from "./AuditService.js";
 import { errorEmbed, successEmbed, warnEmbed } from "../utils/embeds.js";
@@ -175,7 +175,7 @@ async function check(ctx: InteractionContext): Promise<void> {
     });
   }
   const now = new Date();
-  if (pending.expiresAt < now) {
+  if (pending.expiresAt <= now) {
     await prisma.robloxVerification.delete({ where: { id: pending.id } });
     throw new AppError({
       code: "VERIFICATION_EXPIRED",
@@ -205,16 +205,12 @@ async function check(ctx: InteractionContext): Promise<void> {
 
   if (profile.description.toUpperCase().includes(pending.code)) {
     const verifiedAt = now;
-    await prisma.$transaction(async (tx) => {
-      await tx.robloxAccount.upsert({
-        where: { discordUserId: interaction.user.id },
-        update: {
-          robloxUserId: profile.id,
-          robloxUsername: profile.name,
-          robloxDisplayName: profile.displayName,
-          verifiedAt,
-        },
-        create: {
+    try {
+      await prisma.$transaction(async (tx) => {
+        const consumed = await tx.robloxVerification.deleteMany({ where: { id: pending.id, code: pending.code, expiresAt: { gt: new Date() } } });
+        if (consumed.count !== 1) throw new AppError({ code: "VERIFICATION_EXPIRED", friendly: "❌ This code expired or was replaced. Start verification again." });
+        await tx.robloxAccount.create({
+        data: {
           discordUserId: interaction.user.id,
           robloxUserId: profile.id,
           robloxUsername: profile.name,
@@ -223,8 +219,12 @@ async function check(ctx: InteractionContext): Promise<void> {
           linkedByDiscordId: interaction.user.id,
         },
       });
-      await tx.robloxVerification.delete({ where: { id: pending.id } });
-    });
+      });
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "P2002") throw new AppError({ code: "ALREADY_VERIFIED", friendly: "❌ This Discord or Roblox account is already linked. Check `/verify status` first." });
+      throw error;
+    }
+    invalidateOAuthStates(interaction.user.id);
     await audit({
       category: AuditCategory.VERIFICATION,
       action: "LINKED",
@@ -284,13 +284,6 @@ async function startOAuth(interaction: ChatInputCommandInteraction): Promise<voi
       friendly: "❌ Login-with-Roblox is not configured yet. Use `/verify roblox username:YourName` (profile code) instead.",
     });
   }
-  const rl = rateLimiter.consume(
-    `verify:oauth:${interaction.user.id}`,
-    LIMITS.verifyStart.limit,
-    LIMITS.verifyStart.windowMs,
-  );
-  if (!rl.ok) throw new AppError({ code: "RATE_LIMITED", friendly: retryPhrase(rl.retryAfterMs) });
-
   const existing = await prisma.robloxAccount.findUnique({ where: { discordUserId: interaction.user.id } });
   if (existing) {
     throw new AppError({
@@ -376,6 +369,7 @@ async function unlinkSelf(interaction: ChatInputCommandInteraction): Promise<voi
       where: { guildId, discordUserId: interaction.user.id },
     }),
   ]);
+  invalidateOAuthStates(interaction.user.id);
   await audit({
     category: AuditCategory.VERIFICATION,
     action: "UNLINKED",
@@ -409,6 +403,7 @@ async function unlinkTarget(interaction: ChatInputCommandInteraction): Promise<v
     prisma.robloxAccount.delete({ where: { id: account.id } }),
     prisma.robloxVerification.deleteMany({ where: { discordUserId: target.id } }),
   ]);
+  invalidateOAuthStates(target.id);
   await audit({
     category: AuditCategory.VERIFICATION,
     action: "UNLINKED_BY_STAFF",

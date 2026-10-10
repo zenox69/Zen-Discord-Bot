@@ -1,3 +1,4 @@
+import { randomInt } from "node:crypto";
 /**
  * Input sanitization and small text helpers.
  * All user-supplied modal/command text passes through here before it is
@@ -10,7 +11,7 @@ const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 /** Random verification code, e.g. "BW-7K4P9X". */
 export function randomVerificationCode(prefixLen = 2, bodyLen = 6): string {
   const rand = (n: number) =>
-    Array.from({ length: n }, () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]).join("");
+    Array.from({ length: n }, () => CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]).join("");
   return `${rand(prefixLen)}-${rand(bodyLen)}`;
 }
 

@@ -21,6 +21,7 @@ import { log } from "../utils/logger.js";
 import { isAdmin, isStaff } from "../utils/permissions.js";
 import { slugify, zeroPad } from "../utils/text.js";
 import { audit } from "./AuditService.js";
+import { withWorkflowLock } from "../utils/workflowLock.js";
 
 /**
  * TicketService — private order/support channels with strict permissions.
@@ -146,6 +147,10 @@ export async function createTicket(params: {
   member: GuildMember;
   type: "ORDER" | "SUPPORT";
 }): Promise<Ticket> {
+  return withWorkflowLock(`ticket:create:${params.guildId}:${params.member.id}:${params.type}`, () => createTicketLocked(params));
+}
+
+async function createTicketLocked(params: { guild: Guild; guildId: string; member: GuildMember; type: "ORDER" | "SUPPORT" }): Promise<Ticket> {
   const { guild, guildId, member, type } = params;
   const settings: GuildSettings | null = await findSettings(guildId);
   if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not set up yet — run `/setup`." });
@@ -157,7 +162,7 @@ export async function createTicket(params: {
   }
 
   const existing = await prisma.ticket.findFirst({
-    where: { guildId, discordUserId: member.id, status: "OPEN" },
+    where: { guildId, discordUserId: member.id, type, status: "OPEN" },
   });
   if (existing && existing.type === type) {
     throw new AppError({
@@ -230,6 +235,11 @@ export async function createTicket(params: {
       discordUserId: member.id,
       categoryId: settings.ticketCategoryId,
     },
+  }).catch(async (error: unknown) => {
+    // Only compensate the channel created by this failed request; never
+    // delete any existing ticket or database record.
+    await channel.delete("Ticket persistence failed").catch((cleanupError: unknown) => log.error("Could not remove unpersisted ticket channel", { channelId: channel.id }, cleanupError));
+    throw error;
   });
 
   await prisma.ticketEvent.create({
@@ -293,18 +303,22 @@ export async function closeTicket(params: {
   actorDiscordId: string;
   reason?: string | null;
 }): Promise<void> {
+  return withWorkflowLock(`ticket:${params.ticketId}`, () => closeTicketLocked(params));
+}
+
+async function closeTicketLocked(params: { guildId: string; ticketId: number; actorDiscordId: string; reason?: string | null }): Promise<void> {
   const { guildId, ticketId, actorDiscordId, reason } = params;
   const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, include: { order: true } });
   if (!ticket || ticket.guildId !== guildId) {
     throw new AppError({ code: "TICKET_NOT_FOUND", friendly: "❌ Ticket not found.", expected: false });
   }
   if (ticket.status === "CLOSED") {
-    throw new AppError({ code: "TICKET_ALREADY_CLOSED", friendly: "❌ This ticket is already closed." });
+    return;
   }
 
   const client = getBotClient();
   const guild = await client.guilds.fetch(guildId);
-  const actor = await guild.members.fetch(actorDiscordId).catch(() => null);
+  const actor = await guild.members.fetch({ user: actorDiscordId, force: true }).catch(() => null);
   if (!actor || !(await canCloseTicket(guildId, actor, ticket))) {
     const blocker = await getActiveOrderCloseBlocker(ticket);
     throw new AppError({

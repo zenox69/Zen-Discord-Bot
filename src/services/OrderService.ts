@@ -33,6 +33,7 @@ import { getBotClient } from "../utils/botClient.js";
 import { isAdmin, isStaff } from "../utils/permissions.js";
 import { rateLimiter, retryPhrase } from "../utils/rateLimiter.js";
 import { sanitizeInput, zeroPad } from "../utils/text.js";
+import { withWorkflowLock } from "../utils/workflowLock.js";
 
 /**
  * OrderService — order form state machine + order lifecycle.
@@ -98,7 +99,8 @@ function isActorAdmin(ctx: FormCtx): boolean {
 }
 
 /** Customer-form permission: ticket owner only — staff must not order for a customer. */
-function assertFormAccess(order: OrderWithRelations, ctx: FormCtx): void {
+export function assertFormAccess(order: OrderWithRelations, ctx: FormCtx): void {
+  if (order.ticket?.status === "CLOSED") throw new AppError({ code: "TICKET_CLOSED", friendly: "❌ This ticket is closed. Please open a new ticket." });
   if (order.guildId !== ctx.guildId) {
     throw new AppError({ code: "WRONG_GUILD", friendly: "❌ This order belongs to a different server.", expected: false });
   }
@@ -116,7 +118,8 @@ function assertFormAccess(order: OrderWithRelations, ctx: FormCtx): void {
  * blocked. Orders are claimed via claimOrder; unassigned SUBMITTED orders
  * accept a claim from any staff member there.
  */
-function assertStaffCanManage(order: OrderWithRelations, ctx: FormCtx): void {
+export function assertStaffCanManage(order: OrderWithRelations, ctx: FormCtx): void {
+  assertOrderScope(order, ctx);
   if (!isStaffActor(ctx)) throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can modify orders." });
   if (isActorAdmin(ctx)) return;
   if (order.assignedStaffId === ctx.actorId) return;
@@ -127,6 +130,11 @@ function assertStaffCanManage(order: OrderWithRelations, ctx: FormCtx): void {
     });
   }
   throw new AppError({ code: "NOT_ASSIGNED", friendly: "❌ Claim the order before modifying it." });
+}
+
+function assertOrderScope(order: OrderWithRelations, ctx: FormCtx): void {
+  if (order.guildId !== ctx.guildId) throw new AppError({ code: "WRONG_GUILD", friendly: "❌ This order belongs to another server." });
+  if (order.ticket?.channelId && order.ticket.channelId !== ctx.channelId) throw new AppError({ code: "WRONG_CHANNEL", friendly: "❌ Use the controls in this order's ticket." });
 }
 
 /**
@@ -287,8 +295,6 @@ export async function startOrderForm(channel: SendableChannel, ticket: Ticket): 
     return;
   }
 
-  await prisma.order.deleteMany({ where: { ticketId: ticket.id, status: "DRAFT" } });
-
   const menu = new StringSelectMenuBuilder()
     .setCustomId(cid(CUSTOM_ID_PREFIX.order, "select-product", ticket.id))
     .setPlaceholder("Select Product")
@@ -352,6 +358,10 @@ export async function renderStep1(ticket: Ticket, message: EditableMessage): Pro
 }
 
 export async function handleProductSelect(ticketId: number, productValue: string, ctx: FormCtx, message: EditableMessage): Promise<void> {
+  return withWorkflowLock(`ticket:${ticketId}`, () => selectProduct(ticketId, productValue, ctx, message));
+}
+
+async function selectProduct(ticketId: number, productValue: string, ctx: FormCtx, message: EditableMessage): Promise<void> {
   const ticket = await prisma.ticket.findUnique({ where: { id: ticketId } });
   if (!ticket || ticket.guildId !== ctx.guildId || ticket.channelId !== ctx.channelId) {
     throw new AppError({ code: "WRONG_CHANNEL", friendly: "❌ Use the form in your own ticket.", expected: false });
@@ -359,16 +369,17 @@ export async function handleProductSelect(ticketId: number, productValue: string
   if (ticket.discordUserId !== ctx.actorId) {
     throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only the customer who opened this ticket can select products." });
   }
+  if (ticket.status !== "OPEN") throw new AppError({ code: "TICKET_CLOSED", friendly: "❌ This ticket is closed." });
+  const existingOrder = await prisma.order.findUnique({ where: { ticketId } });
+  if (existingOrder && existingOrder.status !== "DRAFT") throw new AppError({ code: "NOT_DRAFT", friendly: "❌ This ticket already has a submitted order." });
 
   const product = await prisma.product.findUnique({ where: { id: Number(productValue) } });
   if (!product || product.guildId !== ctx.guildId || !product.enabled) {
     throw new AppError({ code: "PRODUCT_GONE", friendly: "❌ That product is no longer available. Pick another." });
   }
 
-  await prisma.order.deleteMany({ where: { ticketId: ticket.id, status: "DRAFT" } });
   const account = await prisma.robloxAccount.findUnique({ where: { discordUserId: ticket.discordUserId } });
-  const draft = await prisma.order.create({
-    data: {
+  const draftData = {
       guildId: ctx.guildId,
       number: null,
       ticketId: ticket.id,
@@ -380,8 +391,7 @@ export async function handleProductSelect(ticketId: number, productValue: string
       price: product.price,
       currency: product.currency,
       status: "DRAFT",
-    },
-  });
+    } as const;
 
   const links = await prisma.productCommunity.findMany({ where: { productId: product.id } });
   const communities = await prisma.robloxCommunity.findMany({
@@ -393,12 +403,23 @@ export async function handleProductSelect(ticketId: number, productValue: string
     orderBy: { name: "asc" },
   });
   if (communities.length === 0) {
-    await prisma.order.delete({ where: { id: draft.id } });
     throw new AppError({
       code: "NO_COMMUNITIES",
       friendly: "❌ No communities are currently available for that product. Please choose another product.",
     });
   }
+
+  // Keep the same draft ID on a product change; do not delete recoverable
+  // form rows. A stale select cannot replace a submitted order.
+  const draft = await prisma.$transaction(async (tx) => {
+    if (!existingOrder) return tx.order.create({ data: draftData });
+    const updated = await tx.order.updateMany({
+      where: { id: existingOrder.id, status: "DRAFT", updatedAt: existingOrder.updatedAt },
+      data: { ...draftData, communityId: null, eligibilitySnapshot: Prisma.JsonNull, details: null, preferredOption: null, notes: null },
+    });
+    if (!updated.count) throw new AppError({ code: "STALE_ORDER", friendly: "❌ This form changed. Please use its current controls." });
+    return tx.order.findUniqueOrThrow({ where: { id: existingOrder.id } });
+  });
 
   await message.edit({
     content: `📝 **ORDER FORM**\n\n**Step 2 of 4:** Product selected — **${product.name}**\nSelect a Roblox community below.`,
@@ -430,6 +451,12 @@ export async function handleProductSelect(ticketId: number, productValue: string
 export async function handleCommunitySelect(orderId: number, communityValue: string, ctx: FormCtx, message: EditableMessage): Promise<void> {
   const order = await fetchOrder(orderId);
   if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ This order no longer exists." });
+  return withWorkflowLock(`ticket:${order.ticketId ?? order.ticket?.id ?? `order:${orderId}`}`, () => selectCommunity(orderId, communityValue, ctx, message));
+}
+
+async function selectCommunity(orderId: number, communityValue: string, ctx: FormCtx, message: EditableMessage): Promise<void> {
+  const order = await fetchOrder(orderId);
+  if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ This order no longer exists." });
   if (order.status !== "DRAFT") throw new AppError({ code: "NOT_DRAFT", friendly: "❌ This order is no longer in draft." });
   assertFormAccess(order, ctx);
 
@@ -446,12 +473,15 @@ export async function handleCommunitySelect(orderId: number, communityValue: str
     });
   }
 
-  await prisma.order.update({ where: { id: order.id }, data: { communityId: community.id } });
+  const selected = await prisma.order.update({
+    where: { id: order.id, status: "DRAFT", updatedAt: order.updatedAt },
+    data: { communityId: community.id, eligibilitySnapshot: Prisma.JsonNull },
+  });
 
   // Products that do not require eligibility skip straight to details.
   if (!order.product.requiresEligibility) {
     await prisma.order.update({
-      where: { id: order.id },
+      where: { id: order.id, status: "DRAFT", updatedAt: selected.updatedAt },
       data: {
         eligibilitySnapshot: {
           status: "NOT_REQUIRED",
@@ -511,7 +541,7 @@ export async function handleCommunitySelect(orderId: number, communityValue: str
   const eligible = entry?.status === "ELIGIBLE";
 
   await prisma.order.update({
-    where: { id: order.id },
+    where: { id: order.id, status: "DRAFT", updatedAt: selected.updatedAt },
     data: {
       eligibilitySnapshot: eligible
         ? { status: "ELIGIBLE", checkedAt: new Date().toISOString() }
@@ -660,7 +690,7 @@ export async function submitOrderModal(
 
   const qty = Number(values.quantity);
   if (
-    !Number.isInteger(qty) ||
+    !Number.isSafeInteger(qty) || qty > 2_147_483_647 ||
     qty < order.product.minQuantity ||
     (order.product.maxQuantity !== null && qty > order.product.maxQuantity)
   ) {
@@ -669,9 +699,10 @@ export async function submitOrderModal(
       friendly: `❌ Quantity must be a whole number between **${order.product.minQuantity}** and **${order.product.maxQuantity ?? "unlimited"}**.`,
     });
   }
+  if (Number(order.product.price) * qty > MAX_ORDER_PRICE) throw new AppError({ code: "INVALID_PRICE", friendly: "❌ The total price is too large. Reduce the quantity." });
 
   await prisma.order.update({
-    where: { id: order.id },
+    where: { id: order.id, status: "DRAFT", updatedAt: order.updatedAt },
     data: {
       quantity: qty,
       price: Number(order.product.price) * qty,
@@ -782,14 +813,17 @@ function buildEligibilitySnapshot(order: OrderWithRelations, entry: EligibilityE
 }
 
 async function revalidateEligibility(order: OrderWithRelations, ctx: FormCtx): Promise<RevalidationOutcome> {
-  if (!order.product.requiresEligibility) return { snapshot: null, blocked: null };
-
   if (!order.product.enabled) {
     throw new AppError({ code: "PRODUCT_GONE", friendly: "❌ This product is no longer available. Choose another one." });
   }
   if (!order.community || !order.community.enabled) {
     throw new AppError({ code: "COMMUNITY_GONE", friendly: "❌ The selected community is no longer available. Choose another community." });
   }
+  const links = await prisma.productCommunity.findMany({ where: { productId: order.productId } });
+  if (links.length > 0 && !links.some((link) => link.communityId === order.community!.id)) {
+    throw new AppError({ code: "COMMUNITY_NOT_ALLOWED", friendly: "❌ This product is no longer available in the selected community. Choose another community." });
+  }
+  if (!order.product.requiresEligibility) return { snapshot: null, blocked: null };
   if (!order.robloxUserId) {
     throw new AppError({ code: "NOT_VERIFIED", friendly: "❌ You must verify your Roblox account before ordering." });
   }
@@ -815,7 +849,7 @@ async function revalidateEligibility(order: OrderWithRelations, ctx: FormCtx): P
 
   // No longer eligible: keep the draft, but record the current truth.
   if (snapshot) {
-    await prisma.order.update({ where: { id: order.id }, data: { eligibilitySnapshot: snapshot } });
+    await prisma.order.update({ where: { id: order.id, status: "DRAFT", updatedAt: order.updatedAt }, data: { eligibilitySnapshot: snapshot } });
   }
   let detail = entry ? eligibilityStatusLabel(entry.status) : "Community membership not found";
   if (entry?.status === "NOT_ELIGIBLE" && entry.daysRemaining !== null) {
@@ -828,6 +862,12 @@ async function revalidateEligibility(order: OrderWithRelations, ctx: FormCtx): P
 }
 
 export async function submitOrder(orderId: number, ctx: FormCtx): Promise<SubmitResult> {
+  const order = await fetchOrder(orderId);
+  if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ This order no longer exists." });
+  return withWorkflowLock(`ticket:${order.ticketId ?? order.ticket?.id ?? `order:${orderId}`}`, () => submitOrderLocked(orderId, ctx));
+}
+
+async function submitOrderLocked(orderId: number, ctx: FormCtx): Promise<SubmitResult> {
   const rl = rateLimiter.consume(`order:submit:${ctx.actorId}`, LIMITS.orderSubmit.limit, LIMITS.orderSubmit.windowMs);
   if (!rl.ok) throw new AppError({ code: "RATE_LIMITED", friendly: retryPhrase(rl.retryAfterMs) });
 
@@ -920,7 +960,12 @@ export async function submitOrder(orderId: number, ctx: FormCtx): Promise<Submit
 export async function cancelOrder(orderIdOrTicketRef: string, ctx: FormCtx, reason?: string | null): Promise<void> {
   if (orderIdOrTicketRef.startsWith("ticket:")) {
     const ticketId = Number(orderIdOrTicketRef.slice(7));
-    await prisma.order.deleteMany({ where: { ticketId, status: "DRAFT" } });
+    if (!Number.isSafeInteger(ticketId) || ticketId <= 0) throw new AppError({ code: "BAD_TARGET", friendly: "❌ Invalid ticket reference." });
+    const ticket = await prisma.ticket.findUnique({ where: { id: ticketId } });
+    if (!ticket || ticket.guildId !== ctx.guildId || ticket.channelId !== ctx.channelId || ticket.discordUserId !== ctx.actorId || ticket.status !== "OPEN") {
+      throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ Only the owner can cancel the form in their open ticket." });
+    }
+    await withWorkflowLock(`ticket:${ticketId}`, () => prisma.order.deleteMany({ where: { ticketId, guildId: ctx.guildId, discordUserId: ctx.actorId, status: "DRAFT" } }));
     return;
   }
   const orderId = Number(orderIdOrTicketRef);
@@ -929,6 +974,7 @@ export async function cancelOrder(orderIdOrTicketRef: string, ctx: FormCtx, reas
   }
   const order = await fetchOrder(orderId);
   if (!order) return;
+  assertOrderScope(order, ctx);
   if (!canTransition(order.status, "CANCELLED")) {
     throw new AppError({ code: "BAD_TRANSITION", friendly: `❌ This order (**${STATUS_LABEL[order.status]}**) can no longer be cancelled.` });
   }
@@ -984,6 +1030,7 @@ export async function cancelOrder(orderIdOrTicketRef: string, ctx: FormCtx, reas
 export async function claimOrder(orderId: number, ctx: FormCtx): Promise<void> {
   const order = await fetchOrder(orderId);
   if (!order) throw new AppError({ code: "ORDER_GONE", friendly: "❌ Order not found." });
+  assertOrderScope(order, ctx);
   if (!isStaffActor(ctx)) throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can claim orders." });
   if (order.status !== "SUBMITTED" && order.status !== "STAFF_REVIEW" && order.status !== "QUOTED") {
     throw new AppError({ code: "BAD_TRANSITION", friendly: `❌ Orders in **${STATUS_LABEL[order.status]}** cannot be claimed.` });
@@ -1052,7 +1099,7 @@ export async function setOrderPrice(
   ctx: FormCtx,
   expectedUpdatedAt: Date,
 ): Promise<void> {
-  if (!Number.isFinite(newPrice) || newPrice < 0) {
+  if (!Number.isFinite(newPrice) || newPrice < 0 || newPrice > MAX_ORDER_PRICE) {
     throw new AppError({ code: "INVALID_PRICE", friendly: "❌ Price must be a number ≥ 0." });
   }
   const order = await fetchOrder(orderId);

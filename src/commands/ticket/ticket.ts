@@ -1,5 +1,5 @@
 import { SlashCommandBuilder } from "@discordjs/builders";
-import { GuildMember } from "discord.js";
+import { getInteractionMember } from "../../utils/permissions.js";
 import { prisma } from "../../database/prisma.js";
 import { closeTicket, canCloseTicket, getActiveOrderCloseBlocker, publishTicketPanel } from "../../services/TicketService.js";
 import { baseEmbed, COLORS } from "../../utils/embeds.js";
@@ -47,7 +47,7 @@ export const ticketCommand: MarketplaceCommand = {
     if (ticket.status === "CLOSED") {
       throw new AppError({ code: "TICKET_ALREADY_CLOSED", friendly: "❌ This ticket is already closed." });
     }
-    const member = interaction.member as GuildMember;
+    const member = await getInteractionMember(interaction);
     if (!(await canCloseTicket(guildId, member, ticket))) {
       const blocker = await getActiveOrderCloseBlocker(ticket);
       if (blocker) throw new AppError({ code: "ORDER_ACTIVE", friendly: blocker });

@@ -9,20 +9,24 @@ import { sweepExpiredVerifications } from "./verificationSweeper.js";
 
 const tasks: ScheduledTask[] = [];
 let started = false;
+const runningJobs = new Set<Promise<void>>();
 
 function guarded(name: string, job: () => Promise<void>): () => void {
   let running = false;
   return () => {
+    if (!started) return;
     if (running) {
       log.warn(`Skipping overlapping ${name} job.`);
       return;
     }
     running = true;
-    void job()
+    const work = Promise.resolve().then(job)
       .catch((error) => log.error(`${name} job failed`, error))
       .finally(() => {
         running = false;
+        runningJobs.delete(work);
       });
+    runningJobs.add(work);
   };
 }
 
@@ -50,8 +54,9 @@ export function startJobs(client: Client): void {
   log.info(`Started ${tasks.length} scheduled background jobs.`);
 }
 
-export function stopJobs(): void {
+export async function stopJobs(): Promise<void> {
   for (const task of tasks) task.stop();
   tasks.length = 0;
   started = false;
+  await Promise.allSettled([...runningJobs]);
 }

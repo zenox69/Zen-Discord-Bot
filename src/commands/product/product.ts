@@ -124,7 +124,7 @@ export const productCommand: MarketplaceCommand = {
         requiresEligibility: interaction.options.getBoolean("requires-eligibility"),
         minQuantity: interaction.options.getInteger("min-quantity"),
         maxQuantity: interaction.options.getInteger("max-quantity") ?? undefined,
-        communityNames: interaction.options.getString("communities")
+        communityNames: interaction.options.getString("communities") !== null
           ? interaction.options
               .getString("communities")!
               .split(",")

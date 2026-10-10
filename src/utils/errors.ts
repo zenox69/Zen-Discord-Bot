@@ -36,13 +36,15 @@ export class RobloxApiError extends Error {
   readonly kind: RobloxErrorKind;
   readonly status?: number;
   readonly endpoint: string;
+  readonly retryAfterMs?: number;
 
-  constructor(kind: RobloxErrorKind, endpoint: string, message: string, status?: number) {
+  constructor(kind: RobloxErrorKind, endpoint: string, message: string, status?: number, retryAfterMs?: number) {
     super(message);
     this.name = "RobloxApiError";
     this.kind = kind;
     this.endpoint = endpoint;
     this.status = status;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 

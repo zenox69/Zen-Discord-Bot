@@ -6,6 +6,7 @@ import { getBotClient } from "./botClient.js";
 import { errorEmbed, warnEmbed } from "./embeds.js";
 import { AppError, isAppError, isRobloxApiError } from "./errors.js";
 import { log } from "./logger.js";
+import { redactText } from "./redact.js";
 
 /**
  * Centralized error handling.
@@ -101,7 +102,8 @@ export async function reportError(err: unknown, ctx: ErrorContext): Promise<void
   }
 
   const ref = makeErrorRef();
-  const details = e.stack ?? e.message;
+  const details = redactText(e.stack ?? e.message);
+  const safeMessage = redactText(e.message);
   log.error(`${ref} ${details}`);
   rememberError(ref, details);
 
@@ -126,7 +128,7 @@ export async function reportError(err: unknown, ctx: ErrorContext): Promise<void
           guildId: ctx.guildId,
           category: AuditCategory.SYSTEM,
           action: "ERROR",
-          details: { ref, message: e.message, stack: String(details).slice(0, 4000) },
+          details: { ref, message: safeMessage, stack: String(details).slice(0, 4000) },
         },
       });
       const channelId = settings?.errorLogChannelId;
@@ -143,7 +145,7 @@ export async function reportError(err: unknown, ctx: ErrorContext): Promise<void
             .send({
               embeds: [
                 errorEmbed(`❌ Bot error \`${ref}\``, [
-                  `**Message:** ${e.message.slice(0, 300)}`,
+                  `**Message:** ${safeMessage.slice(0, 300)}`,
                   "",
                   "```",
                   stackSnippet,

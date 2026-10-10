@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   consume: vi.fn(() => ({ ok: true })),
   isOAuthConfigured: vi.fn(() => true),
   buildAuthorizeUrl: vi.fn(() => "https://apis.roblox.com/oauth/v1/authorize?state=x"),
+  invalidateOAuthStates: vi.fn(),
   syncMemberships: vi.fn(async () => undefined),
 }));
 
@@ -31,6 +32,7 @@ vi.mock("../src/services/GuildSettingsService.js", () => ({ findSettings: mocks.
 vi.mock("../src/services/RobloxOAuthService.js", () => ({
   isOAuthVerificationConfigured: mocks.isOAuthConfigured,
   buildAuthorizeUrl: mocks.buildAuthorizeUrl,
+  invalidateOAuthStates: mocks.invalidateOAuthStates,
 }));
 vi.mock("../src/services/EligibilityService.js", () => ({ syncMemberships: mocks.syncMemberships }));
 vi.mock("../src/utils/rateLimiter.js", () => ({
@@ -85,11 +87,26 @@ beforeEach(() => {
   mocks.consume.mockReturnValue({ ok: true });
   mocks.findSettings.mockResolvedValue(null);
   mocks.prisma.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<void>) =>
-    fn({ robloxAccount: { upsert: vi.fn() }, robloxVerification: { delete: vi.fn() } }),
+    fn({ robloxAccount: { create: vi.fn() }, robloxVerification: { deleteMany: vi.fn(async () => ({ count: 1 })) } }),
   );
 });
 
 describe("VerificationService.check — cache freshness", () => {
+  it("does not link a code that expired during the profile request", async () => {
+    mocks.prisma.robloxVerification.findFirst.mockResolvedValue(pendingVerification());
+    mocks.getProfile.mockResolvedValue(profileWith("BW-TEST1"));
+    const create = vi.fn();
+    mocks.prisma.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<void>) => fn({ robloxAccount: { create }, robloxVerification: { deleteMany: vi.fn(async () => ({ count: 0 })) } }));
+    await expect(VerificationService.check(buttonCtx())).rejects.toMatchObject({ code: "VERIFICATION_EXPIRED" });
+    expect(create).not.toHaveBeenCalled();
+  });
+  it("returns a safe conflict when another verification method won the link race", async () => {
+    mocks.prisma.robloxVerification.findFirst.mockResolvedValue(pendingVerification());
+    mocks.getProfile.mockResolvedValue(profileWith("BW-TEST1"));
+    mocks.prisma.$transaction.mockRejectedValue({ code: "P2002" });
+    await expect(VerificationService.check(buttonCtx())).rejects.toMatchObject({ code: "ALREADY_VERIFIED" });
+    expect(mocks.syncMemberships).not.toHaveBeenCalled();
+  });
   it("always fetches the profile with forceRefresh so a just-edited description is seen", async () => {
     mocks.prisma.robloxVerification.findFirst.mockResolvedValue(pendingVerification());
     mocks.getProfile.mockResolvedValue(profileWith("my bio BW-TEST1"));

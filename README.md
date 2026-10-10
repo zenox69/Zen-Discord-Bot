@@ -2,7 +2,7 @@
 
 Production-ready Discord marketplace and order-management bot for Roblox communities. Customers verify their Roblox account, get tracked for community membership, and place persistent orders through private ticket channels. Staff manage products, eligibility, and the full order lifecycle.
 
-Built with TypeScript (strict), discord.js v14, PostgreSQL, and Prisma. All workflow state lives in the database — bot restarts never lose orders, tickets, or verification state.
+Built with TypeScript (strict), discord.js v14, PostgreSQL, and Prisma. Orders, tickets, account links, and profile verification challenges are stored in PostgreSQL. Pending OAuth links are held in memory; request a new link after a bot restart.
 
 ## Features
 
@@ -47,7 +47,7 @@ cp .env.example .env
 | --- | --- |
 | `DISCORD_TOKEN` | Bot token from the Developer Portal. |
 | `DISCORD_CLIENT_ID` | Application ID. |
-| `GUILD_ID` | Optional. Set to register slash commands to one guild instantly; leave empty for global registration (up to ~1h to propagate). |
+| `GUILD_ID` | Optional comma-separated guild allowlist; commands are registered to these guilds. Empty allows all guilds and global registration. Invalid nonempty entries fail startup. |
 | `DATABASE_URL` | PostgreSQL connection string. |
 | `NODE_ENV` | `development` or `production`. |
 | `CRON_ELIGIBILITY_NOTIFIER` | Cron for the eligibility DM job (default: every 6h). |
@@ -56,7 +56,7 @@ cp .env.example .env
 | `ROBLOX_REQUEST_TIMEOUT_MS` | Per-request timeout (1000–30000, default 10000). |
 | `ROBLOX_MAX_RETRIES` | Retries for network/timeout/429/5xx (0–5, default 2). |
 | `ROBLOX_OAUTH_CLIENT_ID` / `ROBLOX_OAUTH_CLIENT_SECRET` / `PUBLIC_BASE_URL` | Optional Roblox OAuth app (Creator Dashboard → User Apps). Enables `/verify oauth` ("Log in with Roblox"). `PUBLIC_BASE_URL` must be the bot's public HTTPS URL; the callback path defaults to `/redirect` (override with `ROBLOX_OAUTH_CALLBACK_PATH`) and must be registered as a redirect URI. At link time the user's own token also records the **official join date** (`OFFICIAL_API`) for tracked communities they belong to. |
-| `HEALTH_PORT` | HTTP port for `GET /healthz` (default 3000, `0` = disabled). Used by platform health checks; also serves the OAuth callback route. |
+| `HEALTH_PORT` | HTTP port for `/healthz`, `/readyz`, and `/livez` (default 3000, `0` = disabled). Also serves the OAuth callback route. |
 
 The process refuses to boot with a missing or malformed variable.
 
@@ -104,8 +104,11 @@ The repo ships a multi-stage `Dockerfile`. On every container start it runs
    | `NODE_ENV` | `production` (also set in the image) |
 
    Leave `ROBLOX_*`, `CRON_*` at defaults. `HEALTH_PORT` defaults to 3000.
-4. **Health check** — HTTP, `GET /healthz` on port 3000. Returns 200 when Discord is connected **and** the DB answers; 503 otherwise.
-5. **Scale: keep it at 1 replica.** Background jobs use in-process overlap guards (not distributed locks), so multiple replicas would double-run jobs.
+4. **Readiness check** — HTTP, `GET /healthz` (or `/readyz`) on port 3000. Returns 200 when Discord is connected **and** the DB answers; 503 otherwise. Database probes have a 3-second response deadline and share one pending query. If configuring a separate liveness/restart check, use `GET /livez`; it remains 200 during transient Discord/DB outages.
+5. **Scale: keep it at 1 replica.** Background jobs and ticket/order workflow guards run in one process. Multiple replicas or overlapping deployment processes can duplicate work; these guards do not coordinate across processes.
+6. **Shutdown** — allow more than 10 seconds of termination grace. Shutdown marks readiness unavailable, stops scheduling, waits for running jobs, then closes the HTTP server, Discord client, and Prisma. The existing 10-second hard exit remains the backstop for stuck operations.
+
+The production hardening changes require no new variables, dependencies, schema changes, or migrations. Existing OAuth callback paths and aliases are preserved; keep the registered redirect URL and forwarding integration unchanged. Northflank builds the image remotely; local Docker is optional.
 
 ### Any other Docker host
 
@@ -122,7 +125,7 @@ npx prisma migrate deploy
 NODE_ENV=production node dist/index.js
 ```
 
-Run under a supervisor that restarts the process on exit (pm2, systemd, etc.). The bot exits on `uncaughtException` by design — all state is in Postgres, so a supervised restart is safe. Example pm2:
+Run under a supervisor that restarts the process on exit (pm2, systemd, etc.). The bot exits on `uncaughtException` by design. Durable workflow records remain in Postgres; pending OAuth links must be issued again after restart. Example pm2:
 
 ```bash
 pm2 start dist/index.js --name zen-marketplace
@@ -173,9 +176,9 @@ Order flow: click **Create Order** on the panel → pick a product in your priva
 
 ## Roblox Data Policy
 
-- Only **public** Roblox endpoints are used, via the public RoProxy mirror (username resolution, profiles, group memberships, avatar headshots).
-- The bot never sends, stores, requests, or logs `.ROBLOSECURITY` or any Roblox credential. Verification is proof of ownership via a public profile description code.
-- All outbound Roblox calls are throttled (serialized with a gap), timeout-bounded, retried with backoff, and TTL-cached.
+- Public Roblox reads use the RoProxy mirror (username resolution, profiles, group memberships, avatar headshots). Optional OAuth uses Roblox's official identity and Open Cloud endpoints.
+- The bot never requests Roblox passwords or `.ROBLOSECURITY` cookies. OAuth access tokens are used during the callback and never persisted; diagnostic logging redacts credentials. Profile verification uses a public description code.
+- Public reads are throttled, timeout-bounded through body consumption, retried with bounded backoff, and cached with hard limits. Concurrent cache misses share requests. OAuth authorization-code exchange remains a single attempt; failed or restarted attempts need a new link.
 
 ## Background Jobs
 
@@ -186,7 +189,7 @@ Order flow: click **Create Order** on the panel → pick a product in your priva
 | Eligibility notifier | every 6h | DMs newly-eligible members once. |
 | Ticket recovery | every 1m | Deletes channels of closed tickets whose delete timer fired, and force-closes tickets whose channels vanished. |
 
-Jobs are overlap-guarded: a long-running job never runs concurrently with itself. On restart, the sweeper and ticket recovery run immediately, then on schedule.
+Jobs are overlap-guarded: a long-running job never runs concurrently with itself. On restart, the sweeper and ticket recovery run immediately, then on schedule. Temporary channel-fetch or deletion failures retain ticket references for the next recovery run; only a confirmed missing channel closes its ticket.
 
 ## Project Structure
 
@@ -216,7 +219,7 @@ npm test               # vitest (unit tests; no database needed)
 npm run prisma:studio  # browse the database
 ```
 
-Tests cover the order state machine, input sanitization, rate limiting, custom-id grammar, bulk-product parsing, permission helpers, and the Roblox API client (mocked fetch: retry, 404 handling, malformed-JSON rejection).
+Tests cover permissions and stale/raw interaction members, allowlisting, ticket duplication and recovery failures, order state transitions and stale draft edits, OAuth state/expiry/replay, atomic profile verification, product restriction edits, Roblox API failures/body timeouts, health probes, and shutdown job draining. Infrastructure is mocked; health tests use a local HTTP server.
 
 ### CI (GitHub Actions)
 
@@ -233,4 +236,4 @@ No Discord or database secrets are required for CI — the unit tests are databa
 - **"This server is not set up yet"** — run `/setup` first (owner/Administrator only).
 - **Eligibility says "first seen" but I joined earlier** — that is by design; the bot only reports what it observed. Use `/eligibility set` with a reason to staff-verify the real date.
 - **"Roblox services unavailable"** — RoProxy is failing or rate-limited. Nothing is marked wrong; the next job run and command retry will recover. Check the error log channel and `ROBLOX_REQUEST_TIMEOUT_MS`.
-- **Ticket channel disappeared mid-order** — the order stays in the database; the recovery job marks the ticket closed, and staff can continue the order via the order message in the channel's history or start a new ticket.
+- **Ticket channel disappeared mid-order** — the order stays in the database and recovery marks the ticket closed. A deleted channel has no usable message history; automatic rebinding of that order to a replacement ticket is not implemented. Staff should review the retained order record before arranging recovery to avoid duplicate fulfillment.

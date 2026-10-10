@@ -1,5 +1,8 @@
 import { SlashCommandBuilder } from "@discordjs/builders";
-import { ChannelType, GuildChannel, type GuildMember } from "discord.js";
+import { ChannelType, GuildChannel } from "discord.js";
+import { getInteractionMember } from "../../utils/permissions.js";
+import { AuditCategory } from "@prisma/client";
+import { audit } from "../../services/AuditService.js";
 import { ensureGuild, updateSettings, type GuildSettingsPatch } from "../../services/GuildSettingsService.js";
 import { publishTicketPanel, type PanelKind } from "../../services/TicketService.js";
 import { getBotClient } from "../../utils/botClient.js";
@@ -150,7 +153,7 @@ export const setupCommand: MarketplaceCommand = {
       // anything already configured untouched, then publishes the panel.
       const guild = interaction.guild;
       if (!guild) throw new AppError({ code: "NO_GUILD", friendly: "❌ This command requires a server." });
-      const member = interaction.member as GuildMember;
+      const member = await getInteractionMember(interaction);
       const lines: string[] = [];
       const all = await guild.channels.fetch();
 
@@ -199,6 +202,7 @@ export const setupCommand: MarketplaceCommand = {
 
       if (Object.keys(patch).length > 0) {
         await updateSettings(guildId, patch);
+        await audit({ category: AuditCategory.SYSTEM, action: "SETUP_INITIALIZED", guildId, actorDiscordId: interaction.user.id, details: patch });
       }
       await publishTicketPanel(guildId, "all");
       lines.push("**Panel** — published in the panel channel.", "", "Next: add communities (`/community add`) and products (`/product add`), then click **Create Order** on the panel.");
@@ -321,6 +325,7 @@ export const setupCommand: MarketplaceCommand = {
 
     if (Object.keys(patch).length > 0) {
       await updateSettings(guildId, patch);
+      await audit({ category: AuditCategory.SYSTEM, action: "SETTINGS_UPDATED", guildId, actorDiscordId: interaction.user.id, details: patch });
     }
     await interaction.reply({
       embeds: [baseEmbed(COLORS.success, settings.marketplaceName).setTitle("✅ Configuration updated").setDescription(summary || "No changes.")],

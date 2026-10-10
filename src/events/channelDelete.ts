@@ -12,14 +12,15 @@ export function onChannelDelete(_client: Client, channel: Channel): void {
   void (async () => {
     try {
       const ticket = await prisma.ticket.findUnique({
-        where: { guildId_channelName: { guildId, channelName: channel.name } },
+        where: { channelId: channel.id },
       });
-      if (!ticket || ticket.status === "CLOSED") return;
+      if (!ticket || ticket.guildId !== guildId || ticket.status === "CLOSED") return;
       await prisma.$transaction([
         prisma.ticket.update({
           where: { id: ticket.id },
           data: {
             status: "CLOSED",
+            channelId: null,
             closedAt: new Date(),
             closeReason: "Channel was deleted outside the bot",
             closedByDiscordId: null,

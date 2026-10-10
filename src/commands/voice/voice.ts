@@ -2,7 +2,6 @@ import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
   type Client,
-  GuildMember,
   type Guild,
 } from "discord.js";
 import {
@@ -13,7 +12,7 @@ import {
 } from "@discordjs/voice";
 import { AppError } from "../../utils/errors.js";
 import type { MarketplaceCommand } from "../../handlers/commandHandler.js";
-import { requireAdmin } from "../../utils/permissions.js";
+import { getInteractionMember, requireAdmin } from "../../utils/permissions.js";
 import { findSettings } from "../../services/GuildSettingsService.js";
 
 /**
@@ -61,10 +60,7 @@ function joinDesired(guild: Guild, channelId: string, client: Client): void {
 async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
   const guild = interaction.guild;
   if (!guild) throw new AppError({ code: "NO_GUILD", friendly: "❌ This can only be used in a server." });
-  const member = interaction.member;
-  if (!(member instanceof GuildMember)) {
-    throw new AppError({ code: "NOT_A_MEMBER", friendly: "❌ This can only be used by server members." });
-  }
+  const member = await getInteractionMember(interaction);
   const settings = await findSettings(guild.id);
   if (!settings) {
     throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not set up yet — run `/setup`." });

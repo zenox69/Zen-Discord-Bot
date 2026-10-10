@@ -1,3 +1,4 @@
+import { redact } from "./redact.js";
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 } as const;
 type Level = keyof typeof LEVELS;
 
@@ -5,6 +6,7 @@ const threshold: Level = process.env.NODE_ENV === "production" ? "info" : "debug
 
 function write(level: Level, args: unknown[]): void {
   if (LEVELS[level] < LEVELS[threshold]) return;
+  args = args.map((value) => redact(value));
   const stamp = new Date().toISOString();
   const line = `[${stamp}] [${level.toUpperCase().padEnd(5)}]`;
   if (level === "error") console.error(line, ...args);

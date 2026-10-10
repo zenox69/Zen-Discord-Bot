@@ -1,6 +1,5 @@
-import { GuildMember } from "discord.js";
 import { AppError } from "../utils/errors.js";
-import { isStaff } from "../utils/permissions.js";
+import { getInteractionMember, requireStaff } from "../utils/permissions.js";
 import { findSettings } from "../services/GuildSettingsService.js";
 import { buildOrderHistory } from "../services/CustomerService.js";
 import type { InteractionContext } from "../handlers/interactionHandler.js";
@@ -23,13 +22,13 @@ export async function showOrderHistory(ctx: InteractionContext): Promise<void> {
 
   if (targetId !== interaction.user.id) {
     const settings = await findSettings(guildId);
-    const member = interaction.member;
-    if (!settings || !(member instanceof GuildMember) || !isStaff(member, settings)) {
+    if (!settings) {
       throw new AppError({
         code: "NOT_STAFF",
         friendly: "❌ Only staff can view another customer's order history.",
       });
     }
+    requireStaff(await getInteractionMember(interaction), settings);
   }
 
   const view = await buildOrderHistory(

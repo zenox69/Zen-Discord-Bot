@@ -4,6 +4,7 @@ import { prisma } from "../database/prisma.js";
 import { getBotClient } from "../utils/botClient.js";
 import { COLORS } from "../utils/embeds.js";
 import { log } from "../utils/logger.js";
+import { redact } from "../utils/redact.js";
 
 /**
  * AuditService — every important action writes a durable AuditLog row AND,
@@ -35,6 +36,7 @@ function humanize(key: string): string {
 }
 
 export async function audit(entry: AuditEntry): Promise<void> {
+  entry = { ...entry, details: redact(entry.details ?? {}) as Record<string, unknown> };
   try {
     await prisma.auditLog.create({
       data: {

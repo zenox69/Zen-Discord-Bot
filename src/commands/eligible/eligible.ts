@@ -3,7 +3,6 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  type GuildMember,
 } from "discord.js";
 import { CUSTOM_ID_PREFIX, LIMITS, cid } from "../../config/constants.js";
 import { prisma } from "../../database/prisma.js";
@@ -13,7 +12,7 @@ import { errorEmbed } from "../../utils/embeds.js";
 import { AppError } from "../../utils/errors.js";
 import { deferEphemeral, smartReply } from "../../utils/interactionReply.js";
 import { rateLimiter, retryPhrase } from "../../utils/rateLimiter.js";
-import { requireStaff } from "../../utils/permissions.js";
+import { getInteractionMember, requireStaff } from "../../utils/permissions.js";
 import type { MarketplaceCommand } from "../../handlers/commandHandler.js";
 
 export const eligibleCommand: MarketplaceCommand = {
@@ -37,7 +36,8 @@ export const eligibleCommand: MarketplaceCommand = {
 
     if (!isSelf) {
       const settings = await findSettings(guildId);
-      if (settings) requireStaff(interaction.member as GuildMember, settings);
+      if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not configured." });
+      requireStaff(await getInteractionMember(interaction), settings);
     }
 
     const account = await prisma.robloxAccount.findUnique({ where: { discordUserId: targetUser.id } });

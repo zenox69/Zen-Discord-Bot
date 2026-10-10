@@ -16,6 +16,8 @@ import { isSendableChannel } from "../utils/channel.js";
 import { AppError } from "../utils/errors.js";
 import { rateLimiter, retryPhrase } from "../utils/rateLimiter.js";
 import type { InteractionContext } from "../handlers/interactionHandler.js";
+import { getInteractionMember } from "../utils/permissions.js";
+import { deferEphemeral, smartReply } from "../utils/interactionReply.js";
 
 /**
  * Ticket panel + close-flow interactions.
@@ -29,11 +31,7 @@ import type { InteractionContext } from "../handlers/interactionHandler.js";
  */
 
 async function requireMember(ctx: InteractionContext): Promise<GuildMember> {
-  const member = ctx.interaction.member;
-  if (!member || !(member instanceof GuildMember)) {
-    throw new AppError({ code: "NOT_A_MEMBER", friendly: "❌ This can only be used by server members." });
-  }
-  return member;
+  return getInteractionMember(ctx.interaction);
 }
 
 /**
@@ -67,6 +65,7 @@ export async function createTicketFromPanel(ctx: InteractionContext): Promise<vo
   );
   if (!rl.ok) throw new AppError({ code: "RATE_LIMITED", friendly: retryPhrase(rl.retryAfterMs) });
 
+  await deferEphemeral(interaction);
   const member = await requireMember(ctx);
   const ticket = await createTicket({
     guild: interaction.guild!,
@@ -86,9 +85,8 @@ export async function createTicketFromPanel(ctx: InteractionContext): Promise<vo
     await startOrderForm(channel, ticket);
   }
 
-  await interaction.reply({
+  await smartReply(interaction, {
     content: `✅ Your ticket is ready: **${ticket.channelName}**`,
-    ephemeral: true,
   });
 }
 

@@ -4,7 +4,6 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  GuildMember,
   type ButtonInteraction,
 } from "discord.js";
 import { CUSTOM_ID_PREFIX, ELIGIBILITY_PAGE_SIZE, LIMITS, cid } from "../config/constants.js";
@@ -13,13 +12,14 @@ import { roblox } from "./RobloxService.js";
 import { audit } from "./AuditService.js";
 import { AppError } from "../utils/errors.js";
 import { addDays, tDate } from "../utils/discordTime.js";
-import { isStaff } from "../utils/permissions.js";
+import { getInteractionMember, requireStaff } from "../utils/permissions.js";
 import { rateLimiter, retryPhrase } from "../utils/rateLimiter.js";
 import { deferEphemeral, smartReply } from "../utils/interactionReply.js";
 import { trunc } from "../utils/embeds.js";
 import type { GroupRole } from "../types/roblox.js";
 import type { InteractionContext } from "../handlers/interactionHandler.js";
 import { findSettings } from "./GuildSettingsService.js";
+import { withWorkflowLock } from "../utils/workflowLock.js";
 
 /**
  * EligibilityService — the heart of the marketplace.
@@ -99,6 +99,10 @@ export async function syncMemberships(
   guildId: string,
   opts?: { forceRefresh?: boolean },
 ): Promise<void> {
+  return withWorkflowLock(`membership:${guildId}:${robloxUserId}`, () => syncMembershipsLocked(robloxUserId, guildId, opts));
+}
+
+async function syncMembershipsLocked(robloxUserId: string, guildId: string, opts?: { forceRefresh?: boolean }): Promise<void> {
   const [communities, roles] = await Promise.all([
     prisma.robloxCommunity.findMany({ where: { guildId } }),
     roblox.getGroupRoles(robloxUserId, opts),
@@ -243,7 +247,7 @@ export async function syncMemberships(
 // Eligibility calculation
 // ---------------------------------------------------------------------------
 
-function computeEntry(
+export function computeEntry(
   community: RobloxCommunity,
   membership: CommunityMembership | null,
   now: Date,
@@ -295,7 +299,7 @@ function computeEntry(
 export async function getEligibility(
   robloxUserId: string,
   guildId: string,
-  opts?: { forceRefresh?: boolean },
+  opts?: { forceRefresh?: boolean; includeAvatar?: boolean },
 ): Promise<EligibilityReport> {
   await syncMemberships(robloxUserId, guildId, opts);
 
@@ -309,7 +313,7 @@ export async function getEligibility(
     .map((community) => computeEntry(community, membershipByCommunity.get(community.id) ?? null, new Date()))
     .sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status]);
 
-  const avatarUrl = await roblox.getAvatarHeadshotUrl(robloxUserId).catch(() => null);
+  const avatarUrl = opts?.includeAvatar === false ? null : await roblox.getAvatarHeadshotUrl(robloxUserId).catch(() => null);
   return { entries, total: entries.length, avatarUrl };
 }
 
@@ -459,14 +463,8 @@ async function resolveTarget(interaction: ButtonInteraction, targetUserId: strin
   const isSelf = targetUserId === interaction.user.id;
   if (!isSelf) {
     const settings = await findSettings(guildId);
-    if (settings) {
-      const member = interaction.member;
-      if (member instanceof GuildMember) {
-        if (!isStaff(member, settings)) {
-          throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can view other users' eligibility." });
-        }
-      }
-    }
+    if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not configured." });
+    requireStaff(await getInteractionMember(interaction), settings);
   }
   const account = await prisma.robloxAccount.findUnique({ where: { discordUserId: targetUserId } });
   if (!account) {
@@ -525,12 +523,8 @@ export async function refreshEligibility(ctx: InteractionContext): Promise<void>
   const isSelf = targetDiscordId === interaction.user.id;
   if (!isSelf) {
     const settings = await findSettings(guildId);
-    const member = interaction.member;
-    if (settings && member instanceof GuildMember) {
-      if (!isStaff(member, settings)) {
-        throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can refresh other users' eligibility." });
-      }
-    }
+    if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not configured." });
+    requireStaff(await getInteractionMember(interaction), settings);
   }
 
   const settings = await findSettings(guildId);
@@ -561,12 +555,8 @@ export async function pageEligibility(ctx: InteractionContext): Promise<void> {
   const isSelf = account.discordUserId === interaction.user.id;
   if (!isSelf) {
     const settings = await findSettings(guildId);
-    const member = interaction.member;
-    if (settings && member instanceof GuildMember) {
-      if (!isStaff(member, settings)) {
-        throw new AppError({ code: "NOT_STAFF", friendly: "❌ Only staff can view other users' eligibility." });
-      }
-    }
+    if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not configured." });
+    requireStaff(await getInteractionMember(interaction), settings);
   }
 
   const settings = await findSettings(guildId);
@@ -589,7 +579,7 @@ export async function getCommunityEligibility(
   communityId: number,
   opts?: { forceRefresh?: boolean },
 ): Promise<EligibilityEntry | null> {
-  const report = await getEligibility(robloxUserId, guildId, opts);
+  const report = await getEligibility(robloxUserId, guildId, { ...opts, includeAvatar: false });
   return report.entries.find((e) => e.community.id === communityId) ?? null;
 }
 

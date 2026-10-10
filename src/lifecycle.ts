@@ -1,7 +1,7 @@
 import { log } from "./utils/logger.js";
 
 export type ShutdownDeps = {
-  stopJobs: () => void;
+  stopJobs: () => void | Promise<void>;
   closeHealth: () => Promise<void>;
   destroyClient: () => void;
   disconnectDb: () => Promise<void>;

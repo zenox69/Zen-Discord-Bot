@@ -13,6 +13,7 @@ import { addProductsBulk, parseBulkLines } from "../services/ProductService.js";
 import { baseEmbed, COLORS, trunc } from "../utils/embeds.js";
 import { formatMoney } from "../utils/discordTime.js";
 import { AppError } from "../utils/errors.js";
+import { getInteractionMember, requireAdmin } from "../utils/permissions.js";
 
 /**
  * /product bulk opens a modal (multi-line text input) because slash-command
@@ -22,6 +23,8 @@ import { AppError } from "../utils/errors.js";
  */
 
 interface BulkPending {
+  guildId: string;
+  actorId: string;
   createdAt: number;
   category: string | null;
   requiresEligibility: boolean | null;
@@ -44,7 +47,8 @@ export async function openBulkModal(
 ): Promise<void> {
   sweepPending();
   const token = randomBytes(8).toString("hex");
-  pendingBulk.set(token, { createdAt: Date.now(), ...options });
+  if (!interaction.guildId) throw new AppError({ code: "NO_GUILD", friendly: "❌ This action requires a server." });
+  pendingBulk.set(token, { createdAt: Date.now(), guildId: interaction.guildId, actorId: interaction.user.id, ...options });
   await interaction.showModal(
     new ModalBuilder()
       .setCustomId(cid(CUSTOM_ID_PREFIX.product, "bulk", token))
@@ -78,10 +82,16 @@ export async function submitBulkModal(ctx: InteractionContext): Promise<void> {
     });
     return;
   }
-  pendingBulk.delete(ctx.parts[0]!);
-
   const settings = await findSettings(guildId);
   if (!settings) throw new AppError({ code: "NOT_CONFIGURED", friendly: "❌ This server is not set up yet." });
+  if (!settings.enabled) throw new AppError({ code: "MARKETPLACE_DISABLED", friendly: "❌ The marketplace is disabled." });
+  if (pending.guildId !== guildId || pending.actorId !== interaction.user.id) {
+    throw new AppError({ code: "NOT_ALLOWED", friendly: "❌ This form belongs to another user or server." });
+  }
+  requireAdmin(await getInteractionMember(interaction), settings);
+  // Recheck after the REST permission request: concurrent submissions may
+  // both have read the pending form before the first one consumed it.
+  if (!pendingBulk.delete(ctx.parts[0]!)) throw new AppError({ code: "STALE_MODAL", friendly: "❌ This form was already submitted." });
 
   const lines = interaction.fields.getTextInputValue("lines") ?? "";
   const { entries, failures: parseFailures } = parseBulkLines(lines);

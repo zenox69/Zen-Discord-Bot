@@ -10,13 +10,13 @@ describe("parseGuildAllowlist", () => {
 
   it("returns an empty set for empty or unset values", () => {
     expect(parseGuildAllowlist("")).toEqual(new Set());
-    expect(parseGuildAllowlist("  ,  ")).toEqual(new Set());
+    expect(parseGuildAllowlist("  ")).toEqual(new Set());
   });
 
-  it("drops entries that are not snowflake-shaped", () => {
-    expect(parseGuildAllowlist("not-an-id,4444444444444444444")).toEqual(
-      new Set(["4444444444444444444"]),
-    );
+  it("rejects malformed entries instead of silently widening access", () => {
+    for (const value of ["not-an-id", "not-an-id,4444444444444444444", ", ,", "00000000000000000"]) {
+      expect(() => parseGuildAllowlist(value)).toThrow(/GUILD_ID/);
+    }
   });
 
   it("parses a single id", () => {

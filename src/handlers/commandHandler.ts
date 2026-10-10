@@ -3,12 +3,12 @@ import {
   type SlashCommandOptionsOnlyBuilder,
   type SlashCommandSubcommandsOnlyBuilder,
 } from "@discordjs/builders";
-import { ChatInputCommandInteraction, PermissionFlagsBits, type GuildMember } from "discord.js";
+import { ChatInputCommandInteraction, PermissionFlagsBits } from "discord.js";
 import { findSettings } from "../services/GuildSettingsService.js";
 import { AppError } from "../utils/errors.js";
 import { handleFatal } from "../utils/errorBoundary.js";
 import { log } from "../utils/logger.js";
-import { requireAdmin, requireStaff } from "../utils/permissions.js";
+import { getInteractionMember, requireAdmin, requireStaff } from "../utils/permissions.js";
 
 /**
  * Slash-command builder type. @discordjs/builders narrows the builder after
@@ -64,14 +64,14 @@ export async function runCommand(
         friendly: "❌ The marketplace is currently disabled on this server.",
       });
     }
-    const member = interaction.member as GuildMember;
     if (settings) {
       if (command.requireAdmin) {
-        requireAdmin(member, settings);
+        requireAdmin(await getInteractionMember(interaction), settings);
       } else if (command.requireStaff) {
-        requireStaff(member, settings);
+        requireStaff(await getInteractionMember(interaction), settings);
       }
     } else if (command.requireAdmin) {
+      const member = await getInteractionMember(interaction);
       // Bootstrap security: before an admin role is configured, only the guild
       // owner or a native Discord Administrator may initialize the bot.
       const canBootstrap =

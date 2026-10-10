@@ -14,6 +14,9 @@ const mocks = vi.hoisted(() => {
   const prisma = {
     $transaction: vi.fn((fn: (t: typeof tx) => Promise<unknown>) => fn(tx)),
     order: { findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn(), deleteMany: vi.fn() },
+    ticket: { findUnique: vi.fn() },
+    robloxCommunity: { findUnique: vi.fn() },
+    productCommunity: { findMany: vi.fn() },
     orderEvent: { create: vi.fn() },
     staffAssignment: { updateMany: vi.fn(), create: vi.fn() },
     guildSettings: { update: vi.fn() },
@@ -47,6 +50,7 @@ import {
   buildOrderStaffControls,
   cancelOrder,
   claimOrder,
+  handleCommunitySelect,
   parsePriceInput,
   setOrderPrice,
   submitOrder,
@@ -115,6 +119,32 @@ beforeEach(() => {
   mocks.getBotClient.mockReturnValue({ channels: { fetch: vi.fn(async () => null) } });
   mocks.prisma.orderEvent.create.mockResolvedValue(undefined);
   mocks.prisma.order.update.mockResolvedValue(undefined);
+  mocks.prisma.productCommunity.findMany.mockResolvedValue([]);
+});
+
+describe("community selection concurrency", () => {
+  it("rejects submit while eligibility is running and guards the late snapshot", async () => {
+    const order = makeOrder({ status: "DRAFT" });
+    mocks.prisma.order.findUnique.mockResolvedValue(order);
+    mocks.prisma.robloxCommunity.findUnique.mockResolvedValue({ ...order.community, guildId: "g-1" });
+    mocks.prisma.productCommunity.findMany.mockResolvedValue([]);
+    const selectedAt = new Date("2026-09-02T00:00:00Z");
+    mocks.prisma.order.update.mockResolvedValue({ updatedAt: selectedAt });
+    let finish!: (entry: EligibilityEntry) => void;
+    mocks.getCommunityEligibility.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    const message = { edit: vi.fn() };
+    const selecting = handleCommunitySelect(1, "20", customer, message);
+    await vi.waitFor(() => expect(mocks.getCommunityEligibility).toHaveBeenCalled());
+    await expect(submitOrder(1, customer)).rejects.toMatchObject({ code: "WORKFLOW_BUSY" });
+    mocks.prisma.order.update.mockRejectedValueOnce(new Error("stale update"));
+    finish(eligibleEntry());
+    await expect(selecting).rejects.toThrow("stale update");
+    expect(mocks.prisma.order.update).toHaveBeenLastCalledWith(expect.objectContaining({
+      where: { id: 1, status: "DRAFT", updatedAt: selectedAt },
+    }));
+    expect(message.edit).not.toHaveBeenCalled();
+    expect(mocks.tx.order.updateMany).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -122,6 +152,13 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("claimOrder", () => {
+  it("rejects cross-guild and cross-channel claims even for admins", async () => {
+    for (const scope of [{ guildId: "other" }, { ticket: { id: 5, channelId: "other" } }]) {
+      mocks.prisma.order.findUnique.mockResolvedValue(makeOrder(scope));
+      await expect(claimOrder(1, admin)).rejects.toBeInstanceOf(AppError);
+      expect(mocks.tx.order.updateMany).not.toHaveBeenCalled();
+    }
+  });
   it("claims a SUBMITTED order: status becomes STAFF_REVIEW and staff becomes assigned", async () => {
     mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "SUBMITTED" }));
     mocks.tx.order.updateMany.mockResolvedValue({ count: 1 });
@@ -362,6 +399,23 @@ describe("setOrderPrice", () => {
 // ---------------------------------------------------------------------------
 
 describe("submitOrder", () => {
+  it("rechecks changed product community restrictions before submission", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "DRAFT" }));
+    mocks.prisma.productCommunity.findMany.mockResolvedValue([{ communityId: 99 }]);
+    await expect(submitOrder(1, customer)).rejects.toMatchObject({ code: "COMMUNITY_NOT_ALLOWED" });
+    expect(mocks.getCommunityEligibility).not.toHaveBeenCalled();
+    expect(mocks.tx.order.updateMany).not.toHaveBeenCalled();
+  });
+  it("rejects customer submission in a closed ticket", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "DRAFT", ticket: { id: 5, channelId: "c-1", status: "CLOSED" } }));
+    await expect(submitOrder(1, customer)).rejects.toMatchObject({ code: "TICKET_CLOSED" });
+    expect(mocks.tx.order.updateMany).not.toHaveBeenCalled();
+  });
+  it("rejects disabled products even when eligibility is not required", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "DRAFT", product: { enabled: false, requiresEligibility: false } }));
+    await expect(submitOrder(1, customer)).rejects.toMatchObject({ code: "PRODUCT_GONE" });
+    expect(mocks.tx.order.updateMany).not.toHaveBeenCalled();
+  });
   function draftOrder(overrides: Record<string, unknown> = {}) {
     return makeOrder({ status: "DRAFT", number: null, ...overrides });
   }
@@ -569,6 +623,18 @@ describe("applyStatus — await payment flow", () => {
 // ---------------------------------------------------------------------------
 
 describe("cancelOrder ownership", () => {
+  it("checks ticket-ref cancellation ownership, guild and channel before deleting a draft", async () => {
+    for (const override of [{ discordUserId: "other" }, { guildId: "other" }, { channelId: "other" }, { status: "CLOSED" }]) {
+      mocks.prisma.ticket.findUnique.mockResolvedValue({ id: 5, discordUserId: "customer-1", guildId: "g-1", channelId: "c-1", status: "OPEN", ...override });
+      await expect(cancelOrder("ticket:5", customer)).rejects.toMatchObject({ code: "NOT_ALLOWED" });
+      expect(mocks.prisma.order.deleteMany).not.toHaveBeenCalled();
+    }
+  });
+  it("rejects cross-guild cancellation even for admins", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ guildId: "other" }));
+    await expect(cancelOrder("1", admin)).rejects.toMatchObject({ code: "WRONG_GUILD" });
+    expect(mocks.tx.order.updateMany).not.toHaveBeenCalled();
+  });
   it("blocks unassigned staff from cancelling someone else's order", async () => {
     mocks.prisma.order.findUnique.mockResolvedValue(makeOrder({ status: "STAFF_REVIEW", assignedStaffId: null }));
     await expect(cancelOrder("1", staff, "reason")).rejects.toMatchObject({ code: "NOT_ASSIGNED" });

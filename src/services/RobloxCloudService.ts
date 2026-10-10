@@ -1,6 +1,7 @@
 import { env } from "../config/env.js";
 import { RobloxApiError } from "../utils/errors.js";
 import { log } from "../utils/logger.js";
+import { retryAfterMs } from "../utils/retryAfter.js";
 
 /**
  * RobloxCloudService — Open Cloud reads (apis.roblox.com) authorized by the
@@ -34,13 +35,19 @@ async function fetchJson<T>(label: string, url: string, accessToken: string): Pr
       if (!res.ok) {
         const err = new RobloxApiError("http", url, `HTTP ${res.status}`, res.status);
         if ((res.status === 429 || res.status >= 500) && attempt === 0) {
+          const delay = retryAfterMs(res.headers.get("retry-after")) ?? 600;
+          if (delay > 8000) throw err;
           lastErr = err;
-          await sleep(600);
+          await res.body?.cancel();
+          await sleep(Math.max(600, delay));
           continue;
         }
         throw err;
       }
-      return (await res.json()) as T;
+      try { return (await res.json()) as T; } catch (error) {
+        if (controller.signal.aborted) throw error;
+        throw new RobloxApiError("invalid", url, "Response was not valid JSON");
+      }
     } catch (err) {
       if (err instanceof RobloxApiError) throw err;
       if (attempt === 0) {
@@ -78,13 +85,15 @@ export async function getUserGroupMembership(
   groupId: string,
   userId: string,
 ): Promise<GroupMembershipInfo | null> {
+  if (!/^[1-9]\d{0,19}$/.test(groupId) || !/^[1-9]\d{0,19}$/.test(userId)) throw new RobloxApiError("invalid", "groupMembership", "Invalid group or user ID");
   const filter = `user == 'users/${userId}'`;
   const url =
     `${CLOUD_BASE}/cloud/v2/groups/${encodeURIComponent(groupId)}/memberships` +
     `?maxPageSize=1&filter=${encodeURIComponent(filter)}`;
   const json = await fetchJson(`groupMembership:${groupId}:${userId}`, url, accessToken);
-  const list = (json as { groupMemberships?: unknown }).groupMemberships;
-  if (!Array.isArray(list) || list.length === 0) return null;
+  const list = (json as { groupMemberships?: unknown } | null)?.groupMemberships;
+  if (!Array.isArray(list)) throw new RobloxApiError("invalid", url, "Malformed membership response");
+  if (list.length === 0) return null;
   const first = list[0] as { createTime?: unknown } | undefined;
   if (!first || typeof first.createTime !== "string") {
     log.warn(`Open Cloud membership for group ${groupId} user ${userId} had no createTime`);
