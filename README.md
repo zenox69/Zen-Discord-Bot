@@ -13,6 +13,7 @@ Built with TypeScript (strict), discord.js v14, PostgreSQL, and Prisma. Orders, 
 - **Ticket system** — private order/support channels with strict permissions, close confirmations, and automatic channel cleanup.
 - **Multi-guild** — every server configures its own marketplace, roles, channels, currency, and communities.
 - **Audit logging** — every meaningful action writes a durable audit row plus optional Discord log-channel posts.
+- **Voice presence** — `/voice join` parks the bot deafened and muted in a voice channel until `/voice leave`; the target survives restarts and the connection recovers automatically from drops.
 - **Background jobs** — scheduled membership refresh, verification expiry, eligibility notifications, and ticket recovery.
 - **Resilient Roblox API layer** — timeouts, bounded retries with backoff, throttling, TTL caching, strict JSON validation, and a hard rule: API failure is never reported as "not a member".
 
@@ -20,7 +21,7 @@ Built with TypeScript (strict), discord.js v14, PostgreSQL, and Prisma. Orders, 
 
 - Node.js >= 24 (LTS)
 - PostgreSQL 13+
-- A Discord application with a bot token (no privileged gateway intents required)
+- A Discord application with a bot token (no privileged gateway intents required; the `/voice` command uses the non-privileged `GuildVoiceStates` intent)
 
 ## Getting Started
 
@@ -28,7 +29,7 @@ Built with TypeScript (strict), discord.js v14, PostgreSQL, and Prisma. Orders, 
 
 1. In the [Discord Developer Portal](https://discord.com/developers/applications), create an application and a bot user.
 2. Copy the **bot token** and the **application (client) ID**.
-3. Invite the bot to your server with the `bot` and `applications.commands` scopes and the **Administrator** permission (or at minimum: Manage Channels, Manage Roles, Manage Messages, Send Messages, Embed Links, Read Message History, Attach Files).
+3. Invite the bot to your server with the `bot` and `applications.commands` scopes and the **Administrator** permission (or at minimum: Manage Channels, Manage Roles, Manage Messages, Send Messages, Embed Links, Read Message History, Attach Files, Connect, View Channel — the last two are for `/voice`, which parks the bot in a voice channel).
 4. Enable **Message Content Intent: not required** — the bot works entirely on interactions.
 
 ### 2. Create the database
@@ -161,6 +162,8 @@ Order flow: click **Create Order** on the panel → pick a product in your priva
 | `/customer profile [user]` | Customer profile: verification, order counts, warnings, notes, order history. |
 | `/ticket setup` | Post the ticket panel in this channel. |
 | `/ticket close` | Close the ticket in this channel. |
+| `/voice join [channel]` | Park the bot in a voice channel — deafened and muted, until `/voice leave` (persists across restarts, auto-rejoins on drops). |
+| `/voice leave` | Leave the voice channel and clear the parked target. |
 
 ## How Eligibility Works
 

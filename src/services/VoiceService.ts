@@ -1,6 +1,7 @@
 import { type Client, type Guild, type VoiceBasedChannel } from "discord.js";
 import {
   entersState,
+  generateDependencyReport,
   getVoiceConnection,
   joinVoiceChannel,
   VoiceConnectionDisconnectReason,
@@ -24,6 +25,9 @@ import { allowedGuildIds, isGuildAllowed } from "../config/guildAllowlist.js";
  *    Bounded retries prevent an infinite loop (e.g. missing Connect permission
  *    or a deleted channel), after which the persisted state is cleared.
  *  - `/voice leave` and a deleted parked channel clear the state.
+ *  - During shutdown (`beginShutdown`) recovery stops WITHOUT clearing the
+ *    persisted target, so the next container rejoins on startup — this avoids
+ *    a deploy-overlap kick/rejoin ping-pong.
  */
 
 const RECONNECT_WAIT_MS = 5_000;
@@ -34,6 +38,23 @@ export class VoiceService {
   private readonly desired = new Map<string, string>();
   /** Consecutive failed fresh-rejoin attempts per guild (reset on Ready). */
   private readonly failedRejoins = new Map<string, number>();
+  /** Connections whose reconnect listeners are already attached. */
+  private readonly armedConnections = new WeakSet<VoiceConnection>();
+  /** Set when the process is shutting down — recovery stops, state is kept. */
+  private shuttingDown = false;
+  private dependencyReportLogged = false;
+
+  /** Stop all recovery during shutdown without clearing the persisted target. */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
+  /** Print @discordjs/voice's dependency report once at boot (diagnostics). */
+  logDependencyReport(): void {
+    if (this.dependencyReportLogged) return;
+    this.dependencyReportLogged = true;
+    log.info(`@discordjs/voice dependency report:\n${generateDependencyReport()}`);
+  }
 
   isDesired(guildId: string, channelId: string): boolean {
     return this.desired.get(guildId) === channelId;
@@ -56,8 +77,9 @@ export class VoiceService {
     await prisma.guildSettings.update({ where: { guildId }, data: { voiceChannelId: channelId } });
   }
 
+  /** Clear the persisted target; updateMany never throws when the row is missing. */
   async clearTarget(guildId: string): Promise<void> {
-    await prisma.guildSettings.update({ where: { guildId }, data: { voiceChannelId: null } });
+    await prisma.guildSettings.updateMany({ where: { guildId }, data: { voiceChannelId: null } });
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -76,24 +98,44 @@ export class VoiceService {
       selfDeaf: true,
       selfMute: true,
     });
+    this.armConnection(guild, channelId, connection);
+    return connection;
+  }
+
+  /**
+   * Attach the reconnect listeners at most once per connection.
+   * joinVoiceChannel() can return an existing connection, so a repeated
+   * `/voice join` must not stack another pair of listeners.
+   */
+  private armConnection(guild: Guild, channelId: string, connection: VoiceConnection): void {
+    if (this.armedConnections.has(connection)) return;
+    this.armedConnections.add(connection);
     // A successful reconnection means the state recovered — reset the counter.
     connection.on(VoiceConnectionStatus.Ready, () => this.failedRejoins.delete(guild.id));
     connection.on(VoiceConnectionStatus.Disconnected, (_oldState, newState) => {
       // Manual = destroyed by /voice leave (which clears state first).
       if (newState.reason === VoiceConnectionDisconnectReason.Manual) return;
-      void this.handleDrop(guild, channelId, connection);
+      void this.handleDrop(guild, channelId, connection).catch((err) =>
+        log.error(`Voice drop recovery failed in guild ${guild.id}`, err),
+      );
     });
-    return connection;
   }
 
   /** Leave the channel and clear all state. Returns false if not in voice. */
   async leavePresence(guildId: string): Promise<boolean> {
     this.desired.delete(guildId);
     this.failedRejoins.delete(guildId);
-    await this.clearTarget(guildId);
     const connection = getVoiceConnection(guildId);
-    if (!connection) return false;
-    connection.destroy();
+    if (!connection) {
+      await this.clearTarget(guildId);
+      return false;
+    }
+    try {
+      connection.destroy();
+    } catch (err) {
+      log.warn(`Voice connection already destroyed in guild ${guildId}`, err);
+    }
+    await this.clearTarget(guildId);
     return true;
   }
 
@@ -137,12 +179,13 @@ export class VoiceService {
 
   /**
    * Drop recovery. Called on every non-manual Disconnected:
-   *  1. If the drop was not for the desired channel, ignore it.
+   *  1. Skip during shutdown and for channels that are no longer desired.
    *  2. Wait briefly for the library's own auto-reconnect (non-4014 drops).
-   *  3. Otherwise destroy the wedged connection and join fresh — bounded, so
-   *     persistent failures (permissions, vanished channel) stop after N tries.
+   *  3. Re-check state, then destroy the wedged connection and join fresh —
+   *     bounded, so persistent failures stop after N tries.
    */
   async handleDrop(guild: Guild, channelId: string, connection: VoiceConnection): Promise<void> {
+    if (this.shuttingDown) return;
     if (!this.isDesired(guild.id, channelId)) return;
 
     const closeCode = (connection.state as { closeCode?: number }).closeCode;
@@ -155,7 +198,15 @@ export class VoiceService {
       // No auto-reconnect (e.g. 4014 kick/move/delete) — recover manually.
     }
 
-    connection.destroy();
+    // State may have changed while waiting (leave, shutdown, another recovery).
+    if (this.shuttingDown || !this.isDesired(guild.id, channelId)) return;
+    if (connection.state.status === VoiceConnectionStatus.Destroyed) return;
+
+    try {
+      connection.destroy();
+    } catch (err) {
+      log.warn(`Voice connection already destroyed in guild ${guild.id}`, err);
+    }
     this.failedRejoins.set(guild.id, (this.failedRejoins.get(guild.id) ?? 0) + 1);
 
     const channel = guild.channels.cache.get(channelId);
@@ -176,7 +227,13 @@ export class VoiceService {
   async onChannelDeleted(guildId: string, channelId: string): Promise<void> {
     if (!this.isDesired(guildId, channelId)) return;
     const connection = getVoiceConnection(guildId);
-    connection?.destroy();
+    if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
+      try {
+        connection.destroy();
+      } catch (err) {
+        log.warn(`Voice connection already destroyed in guild ${guildId}`, err);
+      }
+    }
     await this.clearState(guildId, `Parked voice channel ${channelId} was deleted — cleared /voice state.`);
   }
 

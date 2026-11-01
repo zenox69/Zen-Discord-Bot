@@ -12,6 +12,7 @@ import { setBotClient } from "./utils/botClient.js";
 import { stopJobs } from "./jobs/index.js";
 import { closeHealthServer, markHealthDraining, startHealthServer } from "./health.js";
 import { createShutdown } from "./lifecycle.js";
+import { voiceService } from "./services/VoiceService.js";
 
 /**
  * Entry point. No privileged gateway intents are required — the bot works
@@ -45,7 +46,14 @@ const healthServer = startHealthServer(env.HEALTH_PORT);
 const shutdown = createShutdown({
   stopJobs: async () => { markHealthDraining(); await stopJobs(); },
   closeHealth: () => closeHealthServer(healthServer),
-  destroyClient: () => client.destroy(),
+  destroyClient: () => {
+    // Stop voice drop-recovery FIRST: destroying the Discord client drops any
+    // voice connection, whose Disconnected event would otherwise trigger a
+    // rejoin + DB write while Prisma is closing. The persisted /voice target
+    // is kept, so the next container rejoins on startup (deploy-safe).
+    voiceService.beginShutdown();
+    client.destroy();
+  },
   disconnectDb: () => prisma.$disconnect(),
   exit: (code) => process.exit(code),
 });

@@ -5,11 +5,12 @@ import type { VoiceConnection } from "@discordjs/voice";
 
 const mocks = vi.hoisted(() => ({
   prisma: {
-    guildSettings: { findMany: vi.fn(), update: vi.fn() },
+    guildSettings: { findMany: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   },
   entersState: vi.fn(),
   getVoiceConnection: vi.fn(),
   joinVoiceChannel: vi.fn(),
+  generateDependencyReport: vi.fn(() => "dependency report"),
   VoiceConnectionStatus: {
     Ready: "ready",
     Disconnected: "disconnected",
@@ -27,6 +28,7 @@ vi.mock("@discordjs/voice", () => ({
   entersState: mocks.entersState,
   getVoiceConnection: mocks.getVoiceConnection,
   joinVoiceChannel: mocks.joinVoiceChannel,
+  generateDependencyReport: mocks.generateDependencyReport,
   VoiceConnectionStatus: mocks.VoiceConnectionStatus,
   VoiceConnectionDisconnectReason: mocks.VoiceConnectionDisconnectReason,
 }));
@@ -72,6 +74,8 @@ function lastConnection(): FakeConnection {
   return results[results.length - 1]!.value as FakeConnection;
 }
 
+const clearCall = { where: { guildId: "g-1" }, data: { voiceChannelId: null } };
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.allowedGuildIds.clear();
@@ -91,7 +95,7 @@ describe("VoiceService — persistence", () => {
     await expect(svc.getPersistedTargets()).resolves.toEqual([{ guildId: "g-1", channelId: "c-1" }]);
   });
 
-  it("persists and clears the target through prisma", async () => {
+  it("persists the target via update and clears it via updateMany", async () => {
     const svc = new VoiceService();
     await svc.persistTarget("g-1", "c-1");
     expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
@@ -99,10 +103,7 @@ describe("VoiceService — persistence", () => {
       data: { voiceChannelId: "c-1" },
     });
     await svc.clearTarget("g-1");
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
   });
 });
 
@@ -127,19 +128,24 @@ describe("VoiceService — join / leave", () => {
     await expect(svc.leavePresence("g-1")).resolves.toBe(true);
     expect(conn.destroyed).toBe(true);
     expect(svc.isDesired("g-1", "c-1")).toBe(false);
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
   });
 
   it("leave reports not-in-voice but still clears state", async () => {
     const svc = new VoiceService();
     await expect(svc.leavePresence("g-1")).resolves.toBe(false);
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
+  });
+
+  it("arms reconnect listeners only once per connection", () => {
+    const shared = new FakeConnection();
+    mocks.joinVoiceChannel.mockReturnValue(shared);
+    const svc = new VoiceService();
+    const guild = makeGuild("g-1", new Map([["c-1", makeChannel("c-1")]]));
+    svc.joinPresence(guild, "c-1");
+    svc.joinPresence(guild, "c-1");
+    expect(shared.listenerCount("disconnected")).toBe(1);
+    expect(shared.listenerCount("ready")).toBe(1);
   });
 });
 
@@ -173,6 +179,29 @@ describe("VoiceService — drop recovery", () => {
     expect(mocks.joinVoiceChannel).toHaveBeenCalledTimes(2);
   });
 
+  it("does not throw or rejoin when the connection was already destroyed during the wait", async () => {
+    const svc = new VoiceService();
+    const guild = makeGuild();
+    svc.joinPresence(guild, "c-1");
+    const conn = lastConnection();
+    conn.state.status = "destroyed";
+    await expect(svc.handleDrop(guild, "c-1", conn as unknown as VoiceConnection)).resolves.toBeUndefined();
+    expect(mocks.joinVoiceChannel).toHaveBeenCalledTimes(1);
+  });
+
+  it("shutdown stops recovery without clearing the persisted target", async () => {
+    const svc = new VoiceService();
+    svc.beginShutdown();
+    const guild = makeGuild();
+    svc.joinPresence(guild, "c-1");
+    const conn = lastConnection();
+    await svc.handleDrop(guild, "c-1", conn as unknown as VoiceConnection);
+    expect(conn.destroyed).toBe(false);
+    expect(mocks.joinVoiceChannel).toHaveBeenCalledTimes(1);
+    expect(mocks.prisma.guildSettings.updateMany).not.toHaveBeenCalled();
+    expect(svc.isDesired("g-1", "c-1")).toBe(true);
+  });
+
   it("clears state when the parked channel is gone", async () => {
     const svc = new VoiceService();
     const guild = makeGuild("g-1", new Map());
@@ -180,10 +209,7 @@ describe("VoiceService — drop recovery", () => {
     const conn = lastConnection();
     await svc.handleDrop(guild, "c-1", conn as unknown as VoiceConnection);
     expect(mocks.joinVoiceChannel).toHaveBeenCalledTimes(1);
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
   });
 
   it("clears state when the bot lacks Connect permission to rejoin", async () => {
@@ -193,10 +219,7 @@ describe("VoiceService — drop recovery", () => {
     const conn = lastConnection();
     await svc.handleDrop(guild, "c-1", conn as unknown as VoiceConnection);
     expect(mocks.joinVoiceChannel).toHaveBeenCalledTimes(1);
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
   });
 
   it("stops retrying after MAX_REJOIN_ATTEMPTS and clears state", async () => {
@@ -208,10 +231,7 @@ describe("VoiceService — drop recovery", () => {
     }
     // initial join + 2 successful rejoins, then the third failure clears state
     expect(mocks.joinVoiceChannel).toHaveBeenCalledTimes(3);
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
   });
 });
 
@@ -225,17 +245,14 @@ describe("VoiceService — channel deletion", () => {
     await svc.onChannelDeleted("g-1", "c-1");
     expect(conn.destroyed).toBe(true);
     expect(svc.isDesired("g-1", "c-1")).toBe(false);
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
   });
 
   it("ignores deletion of a channel it is not parked in", async () => {
     const svc = new VoiceService();
     await svc.onChannelDeleted("g-1", "c-other");
     expect(mocks.getVoiceConnection).not.toHaveBeenCalled();
-    expect(mocks.prisma.guildSettings.update).not.toHaveBeenCalled();
+    expect(mocks.prisma.guildSettings.updateMany).not.toHaveBeenCalled();
   });
 });
 
@@ -255,10 +272,7 @@ describe("VoiceService — startup rejoin", () => {
     const svc = new VoiceService();
     await expect(svc.rejoinPersisted(makeClient(new Map()))).resolves.toBe(0);
     expect(mocks.joinVoiceChannel).not.toHaveBeenCalled();
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
   });
 
   it("clears a persisted target whose channel is gone", async () => {
@@ -267,10 +281,7 @@ describe("VoiceService — startup rejoin", () => {
     const guild = makeGuild("g-1", new Map());
     await svc.rejoinPersisted(makeClient(new Map([["g-1", guild]])));
     expect(mocks.joinVoiceChannel).not.toHaveBeenCalled();
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
   });
 
   it("clears a persisted target when the bot lacks Connect permission", async () => {
@@ -279,10 +290,7 @@ describe("VoiceService — startup rejoin", () => {
     const svc = new VoiceService();
     await svc.rejoinPersisted(makeClient(new Map([["g-1", guild]])));
     expect(mocks.joinVoiceChannel).not.toHaveBeenCalled();
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
   });
 
   it("clears a persisted target in a non-allowlisted guild", async () => {
@@ -293,9 +301,15 @@ describe("VoiceService — startup rejoin", () => {
     const svc = new VoiceService();
     await svc.rejoinPersisted(makeClient(new Map([["g-1", guild]])));
     expect(mocks.joinVoiceChannel).not.toHaveBeenCalled();
-    expect(mocks.prisma.guildSettings.update).toHaveBeenCalledWith({
-      where: { guildId: "g-1" },
-      data: { voiceChannelId: null },
-    });
+    expect(mocks.prisma.guildSettings.updateMany).toHaveBeenCalledWith(clearCall);
+  });
+});
+
+describe("VoiceService — diagnostics", () => {
+  it("logs the dependency report only once", () => {
+    const svc = new VoiceService();
+    svc.logDependencyReport();
+    svc.logDependencyReport();
+    expect(mocks.generateDependencyReport).toHaveBeenCalledTimes(1);
   });
 });

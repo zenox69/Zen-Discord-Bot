@@ -31,6 +31,7 @@ export function onReady(client: Client): void {
   // Voice: rejoin any channel the bot was parked in before the restart.
   // Non-fatal — the bot still comes online even if a rejoin is impossible
   // (the service clears stale targets itself).
+  voiceService.logDependencyReport();
   void voiceService.rejoinPersisted(client).catch((err) => log.error("Failed to rejoin persisted voice channels", err));
   startJobs(client);
   log.info(
