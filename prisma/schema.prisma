@@ -92,6 +92,9 @@ model GuildSettings {
   ticketCounter            Int      @default(0)
   orderCounter             Int      @default(0)
   enabled                  Boolean  @default(true)
+  /// Persisted /voice join target — the bot rejoins this channel after a
+  /// restart/deploy and recovers it after connection drops. Null = parked nowhere.
+  voiceChannelId           String?
   createdAt                DateTime @default(now())
   updatedAt                DateTime @updatedAt
 

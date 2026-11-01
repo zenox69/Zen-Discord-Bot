@@ -3,6 +3,7 @@ import { log } from "../utils/logger.js";
 import { startJobs } from "../jobs/index.js";
 import { allowedGuildIds, isGuildAllowed } from "../config/guildAllowlist.js";
 import { registerSlashCommands } from "../utils/registerCommands.js";
+import { voiceService } from "../services/VoiceService.js";
 
 export function onReady(client: Client): void {
   if (!client.user) return;
@@ -27,6 +28,10 @@ export function onReady(client: Client): void {
     // non-fatal — the bot still comes online.
     void registerSlashCommands().catch((err) => log.error("Failed to auto-register slash commands", err));
   }
+  // Voice: rejoin any channel the bot was parked in before the restart.
+  // Non-fatal — the bot still comes online even if a rejoin is impossible
+  // (the service clears stale targets itself).
+  void voiceService.rejoinPersisted(client).catch((err) => log.error("Failed to rejoin persisted voice channels", err));
   startJobs(client);
   log.info(
     allowedGuildIds.size > 0

@@ -1,19 +1,9 @@
-import {
-  SlashCommandBuilder,
-  type ChatInputCommandInteraction,
-  type Client,
-  type Guild,
-} from "discord.js";
-import {
-  entersState,
-  getVoiceConnection,
-  joinVoiceChannel,
-  VoiceConnectionStatus,
-} from "@discordjs/voice";
+import { SlashCommandBuilder, type ChatInputCommandInteraction } from "discord.js";
 import { AppError } from "../../utils/errors.js";
 import type { MarketplaceCommand } from "../../handlers/commandHandler.js";
 import { getInteractionMember, requireAdmin } from "../../utils/permissions.js";
 import { findSettings } from "../../services/GuildSettingsService.js";
+import { voiceService } from "../../services/VoiceService.js";
 
 /**
  * Voice presence: park the bot in a voice channel — self-deafened and
@@ -21,41 +11,9 @@ import { findSettings } from "../../services/GuildSettingsService.js";
  * not listen to, record, or play anything (self-deaf also disables audio
  * receiving at the Discord gateway level).
  *
- * "Never leaves": the desired channel is remembered per guild and the
- * connection auto-rejoins if it drops. State is in-memory — a restart
- * (deploy) clears it, so run /voice join again after a deploy.
+ * "Never leaves": the desired channel is persisted and the connection
+ * auto-rejoins if it drops, including after a restart/deploy.
  */
-
-const desiredVoiceChannels = new Map<string, string>();
-
-function joinDesired(guild: Guild, channelId: string, client: Client): void {
-  desiredVoiceChannels.set(guild.id, channelId);
-  const connection = joinVoiceChannel({
-    channelId,
-    guildId: guild.id,
-    adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: true,
-    selfMute: true,
-  });
-
-  // "Never leave unless told": if the connection drops (network blip, moved
-  // channel, brief kick), try an in-place rejoin, then a full rejoin from
-  // the remembered channel. /voice leave clears the desired state first.
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
-    if (desiredVoiceChannels.get(guild.id) !== channelId) return;
-    try {
-      await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-      ]);
-    } catch {
-      setTimeout(() => {
-        if (desiredVoiceChannels.get(guild.id) !== channelId) return;
-        joinDesired(guild, channelId, client);
-      }, 5_000).unref();
-    }
-  });
-}
 
 async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
   const guild = interaction.guild;
@@ -86,22 +44,21 @@ async function execute(interaction: ChatInputCommandInteraction): Promise<void> 
       });
     }
 
-    joinDesired(guild, channel.id, interaction.client);
+    await voiceService.persistTarget(guild.id, channel.id);
+    voiceService.joinPresence(guild, channel.id);
 
     await interaction.reply({
-      content: `🔇 Parked in **${channel.name}** — deafened and muted. I will stay here until \`/voice leave\`.`,
+      content: `🔇 Parked in **${channel.name}** — deafened and muted. I will stay here until \`/voice leave\`, even across restarts.`,
       ephemeral: true,
     });
     return;
   }
 
   // leave
-  desiredVoiceChannels.delete(guild.id);
-  const connection = getVoiceConnection(guild.id);
-  if (!connection) {
+  const hadConnection = await voiceService.leavePresence(guild.id);
+  if (!hadConnection) {
     throw new AppError({ code: "NOT_IN_VOICE", friendly: "❌ I'm not in a voice channel here." });
   }
-  connection.destroy();
   await interaction.reply({ content: "👋 Left the voice channel.", ephemeral: true });
 }
 
