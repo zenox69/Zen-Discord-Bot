@@ -53,7 +53,12 @@ export class VoiceService {
   logDependencyReport(): void {
     if (this.dependencyReportLogged) return;
     this.dependencyReportLogged = true;
-    log.info(`@discordjs/voice dependency report:\n${generateDependencyReport()}`);
+    try {
+      log.info(`@discordjs/voice dependency report:\n${generateDependencyReport()}`);
+    } catch (err) {
+      // Never block startup/jobs over a diagnostics report.
+      log.warn("Failed to generate @discordjs/voice dependency report", err);
+    }
   }
 
   isDesired(guildId: string, channelId: string): boolean {
@@ -98,16 +103,18 @@ export class VoiceService {
       selfDeaf: true,
       selfMute: true,
     });
-    this.armConnection(guild, channelId, connection);
+    this.armConnection(guild, connection);
     return connection;
   }
 
   /**
    * Attach the reconnect listeners at most once per connection.
    * joinVoiceChannel() can return an existing connection, so a repeated
-   * `/voice join` must not stack another pair of listeners.
+   * `/voice join` must not stack another pair of listeners. The channel id is
+   * read at drop time (not closed over): joining a NEW channel while parked
+   * moves the same connection, and recovery must target the current channel.
    */
-  private armConnection(guild: Guild, channelId: string, connection: VoiceConnection): void {
+  private armConnection(guild: Guild, connection: VoiceConnection): void {
     if (this.armedConnections.has(connection)) return;
     this.armedConnections.add(connection);
     // A successful reconnection means the state recovered — reset the counter.
@@ -115,7 +122,9 @@ export class VoiceService {
     connection.on(VoiceConnectionStatus.Disconnected, (_oldState, newState) => {
       // Manual = destroyed by /voice leave (which clears state first).
       if (newState.reason === VoiceConnectionDisconnectReason.Manual) return;
-      void this.handleDrop(guild, channelId, connection).catch((err) =>
+      const current = this.desired.get(guild.id);
+      if (!current) return;
+      void this.handleDrop(guild, current, connection).catch((err) =>
         log.error(`Voice drop recovery failed in guild ${guild.id}`, err),
       );
     });

@@ -147,6 +147,27 @@ describe("VoiceService — join / leave", () => {
     expect(shared.listenerCount("disconnected")).toBe(1);
     expect(shared.listenerCount("ready")).toBe(1);
   });
+
+  it("recovery retargets the CURRENT desired channel when the connection moves", async () => {
+    const shared = new FakeConnection();
+    mocks.joinVoiceChannel.mockReturnValue(shared);
+    const svc = new VoiceService();
+    const guild = makeGuild("g-1", new Map([
+      ["c-1", makeChannel("c-1")],
+      ["c-2", makeChannel("c-2")],
+    ]));
+    svc.joinPresence(guild, "c-1");
+    svc.joinPresence(guild, "c-2"); // same connection moved to a new channel
+    expect(svc.isDesired("g-1", "c-2")).toBe(true);
+
+    shared.emit("disconnected", {}, { reason: 0, closeCode: 4014 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Fresh rejoin must target the new channel, not the frozen first one.
+    expect(shared.destroyed).toBe(true);
+    expect(mocks.joinVoiceChannel).toHaveBeenCalledTimes(3); // join c-1, move to c-2, rejoin c-2
+    expect(mocks.joinVoiceChannel).toHaveBeenLastCalledWith(expect.objectContaining({ channelId: "c-2" }));
+  });
 });
 
 describe("VoiceService — drop recovery", () => {
@@ -311,5 +332,13 @@ describe("VoiceService — diagnostics", () => {
     svc.logDependencyReport();
     svc.logDependencyReport();
     expect(mocks.generateDependencyReport).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failing dependency report is non-fatal", () => {
+    mocks.generateDependencyReport.mockImplementation(() => {
+      throw new Error("boom");
+    });
+    const svc = new VoiceService();
+    expect(() => svc.logDependencyReport()).not.toThrow();
   });
 });

@@ -44,15 +44,21 @@ const healthServer = startHealthServer(env.HEALTH_PORT);
 
 // One guarded shutdown routine for every exit path (see lifecycle.ts).
 const shutdown = createShutdown({
-  stopJobs: async () => { markHealthDraining(); await stopJobs(); },
+  stopJobs: async () => {
+    // Begin voice shutdown immediately — BEFORE waiting for running jobs.
+    // A drop during the drain window (e.g. the incoming container kicks the
+    // old one mid-deploy) must not trigger recovery, or overlapping processes
+    // could ping-pong the voice session. The persisted /voice target is kept,
+    // so the next container rejoins on startup.
+    markHealthDraining();
+    voiceService.beginShutdown();
+    await stopJobs();
+  },
   closeHealth: () => closeHealthServer(healthServer),
   destroyClient: () => {
-    // Stop voice drop-recovery FIRST: destroying the Discord client drops any
-    // voice connection, whose Disconnected event would otherwise trigger a
-    // rejoin + DB write while Prisma is closing. The persisted /voice target
-    // is kept, so the next container rejoins on startup (deploy-safe).
-    voiceService.beginShutdown();
-    client.destroy();
+    // Return the promise so shutdown waits for the gateway to actually close
+    // before Prisma is disconnected and the process exits.
+    return client.destroy();
   },
   disconnectDb: () => prisma.$disconnect(),
   exit: (code) => process.exit(code),
