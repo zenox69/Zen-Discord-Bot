@@ -9,7 +9,12 @@ export interface SendableChannel {
   id: string;
   name: string;
   type: number;
-  send: (options: { content?: string; embeds?: unknown[]; components?: unknown[] }) => Promise<unknown>;
+  send: (options: {
+    content?: string;
+    embeds?: unknown[];
+    components?: unknown[];
+    allowedMentions?: unknown;
+  }) => Promise<unknown>;
   delete?: (reason?: string) => Promise<unknown>;
 }
 

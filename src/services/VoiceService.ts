@@ -154,6 +154,7 @@ export class VoiceService {
    * not allowlisted, or whose channel vanished — no retry loops at boot.
    */
   async rejoinPersisted(client: Client): Promise<number> {
+    if (this.shuttingDown) return 0; // A delayed startup rejoin must not fire mid-shutdown.
     const targets = await this.getPersistedTargets();
     let rejoined = 0;
     for (const { guildId, channelId } of targets) {

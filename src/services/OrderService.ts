@@ -930,6 +930,8 @@ async function submitOrderLocked(orderId: number, ctx: FormCtx): Promise<SubmitR
       const sent = (await channel
         .send({
           content: `<@${order.discordUserId}>`,
+          // The customer is pinged on purpose: their order just went live.
+          allowedMentions: { users: [order.discordUserId] },
           embeds: [await renderOrderEmbed(withRelations)],
           components: buildOrderStaffControls(withRelations),
         })

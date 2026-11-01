@@ -21,6 +21,11 @@ import { voiceService } from "./services/VoiceService.js";
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
   partials: [Partials.Channel],
+  // Never auto-ping @everyone/@here/roles/users from message or embed text —
+  // e.g. order details typed into modals can't be used to mass-ping. Intended
+  // pings (ticket welcomes, order notifications) opt back in explicitly via
+  // the message's own allowedMentions (see OrderService / TicketService).
+  allowedMentions: { parse: [] },
 });
 
 setBotClient(client);

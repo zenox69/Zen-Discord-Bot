@@ -278,6 +278,16 @@ describe("VoiceService — channel deletion", () => {
 });
 
 describe("VoiceService — startup rejoin", () => {
+  it("does not rejoin persisted targets once shutdown has begun", async () => {
+    mocks.prisma.guildSettings.findMany.mockResolvedValue([{ guildId: "g-1", voiceChannelId: "c-1" }]);
+    const guild = makeGuild("g-1", new Map([["c-1", makeChannel("c-1")]]));
+    const svc = new VoiceService();
+    svc.beginShutdown();
+    await expect(svc.rejoinPersisted(makeClient(new Map([["g-1", guild]])))).resolves.toBe(0);
+    expect(mocks.joinVoiceChannel).not.toHaveBeenCalled();
+    expect(mocks.prisma.guildSettings.findMany).not.toHaveBeenCalled();
+  });
+
   it("rejoins persisted targets whose channel exists and is joinable", async () => {
     mocks.prisma.guildSettings.findMany.mockResolvedValue([{ guildId: "g-1", voiceChannelId: "c-1" }]);
     const guild = makeGuild("g-1", new Map([["c-1", makeChannel("c-1")]]));

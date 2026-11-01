@@ -5,6 +5,10 @@ import { allowedGuildIds, isGuildAllowed } from "../config/guildAllowlist.js";
 import { registerSlashCommands } from "../utils/registerCommands.js";
 import { voiceService } from "../services/VoiceService.js";
 
+/** Wait before rejoining persisted voice channels after a (re)deploy so an
+ * outgoing container has time to receive SIGTERM and drop its session first. */
+const VOICE_REJOIN_STARTUP_DELAY_MS = 12_000;
+
 export function onReady(client: Client): void {
   if (!client.user) return;
   client.user.setPresence({
@@ -29,10 +33,18 @@ export function onReady(client: Client): void {
     void registerSlashCommands().catch((err) => log.error("Failed to auto-register slash commands", err));
   }
   // Voice: rejoin any channel the bot was parked in before the restart.
+  // Delayed a few seconds: during a rolling deploy the incoming container can
+  // become ready before the outgoing one receives SIGTERM and drops its voice
+  // session; the delay lets the old one settle so it cannot rejoin and kick us
+  // back. The target is persisted, so nothing is lost while waiting.
   // Non-fatal — the bot still comes online even if a rejoin is impossible
   // (the service clears stale targets itself).
   voiceService.logDependencyReport();
-  void voiceService.rejoinPersisted(client).catch((err) => log.error("Failed to rejoin persisted voice channels", err));
+  setTimeout(() => {
+    void voiceService.rejoinPersisted(client).catch((err) =>
+      log.error("Failed to rejoin persisted voice channels", err),
+    );
+  }, VOICE_REJOIN_STARTUP_DELAY_MS).unref();
   startJobs(client);
   log.info(
     allowedGuildIds.size > 0

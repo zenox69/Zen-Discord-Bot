@@ -290,6 +290,8 @@ async function createTicketLocked(params: { guild: Guild; guildId: string; membe
 
   const sent = await channel.send({
     content: `${welcome}\n\nPowered by **${botName}**`,
+    // The customer who opened the ticket is pinged on purpose.
+    allowedMentions: { users: [member.id] },
     components: [closeRow],
   });
 
@@ -383,6 +385,8 @@ async function closeTicketLocked(params: { guildId: string; ticketId: number; ac
     await channel
       .send({
         content: `🔒 This ticket was closed by <@${actorDiscordId}>${reason ? ` — **${reason}**` : ""}. The channel will be deleted shortly.`,
+        // The closer is pinged on purpose (only real users — "system" is inert).
+        allowedMentions: { users: [actorDiscordId] },
       })
       .catch(() => undefined);
     setTimeout(() => {
